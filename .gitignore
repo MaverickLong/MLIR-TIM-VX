@@ -1,3 +1,9 @@
+# Build Files
+build/
+
+# MLIR Intermediate Assemblies
+*.mlir
+
 # Prerequisites
 *.d
 

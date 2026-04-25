@@ -1,5 +1,52 @@
+The MLIR-TIM-VX project various third-party components under other open source
+licenses. This section summarizes those components and their licenses.
+
+For indirect thrid party components bundled by the following components, please
+refer to their $SUBMODULE/third_party/ for the LICENSEs accordingly.
+
+============
+
+TIM-VX (https://github.com/VeriSilicon/TIM-VX): MIT License
+
+/****************************************************************************
+*
+*    Copyright (c) 2020-2023 Vivante Corporation
+*
+*    Permission is hereby granted, free of charge, to any person obtaining a
+*    copy of this software and associated documentation files (the "Software"),
+*    to deal in the Software without restriction, including without limitation
+*    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+*    and/or sell copies of the Software, and to permit persons to whom the
+*    Software is furnished to do so, subject to the following conditions:
+*
+*    The above copyright notice and this permission notice shall be included in
+*    all copies or substantial portions of the Software.
+*
+*    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+*    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+*    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+*    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+*    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+*    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+*    DEALINGS IN THE SOFTWARE.
+*
+*****************************************************************************/
+
+This product bundles various third-party components under other open source licenses.
+This section summarizes those components and their licenses.
+
+3rdparty/half/half.h
+MIT License
+
+jsoncpp(https://github.com/open-source-parsers/jsoncpp)
+MIT License
+
+============
+
+llvm-project (https://github.com/llvm/llvm-project): Apache License v2.0 with LLVM Exceptions
+
 ==============================================================================
-The MLIR-TIM-VX Project is under the Apache License v2.0 with LLVM Exceptions:
+The LLVM Project is under the Apache License v2.0 with LLVM Exceptions:
 ==============================================================================
 
                                  Apache License
@@ -204,6 +251,7 @@ The MLIR-TIM-VX Project is under the Apache License v2.0 with LLVM Exceptions:
     See the License for the specific language governing permissions and
     limitations under the License.
 
+
 ---- LLVM Exceptions to the Apache 2.0 License ----
 
 As an exception, if, as a result of your compiling your source code, portions
@@ -226,11 +274,10 @@ Software from third parties included in the LLVM Project:
 The LLVM Project contains third party software which is under different license
 terms. All such code will be identified clearly using at least one of two
 mechanisms:
-
-1. It will be in a separate directory tree with its own `LICENSE.txt` or
+1) It will be in a separate directory tree with its own `LICENSE.txt` or
    `LICENSE` file at the top containing the specific license and restrictions
    which apply to that software, or
-2. It will contain specific license and restriction terms at the top of every
+2) It will contain specific license and restriction terms at the top of every
    file.
 
 ==============================================================================
@@ -271,8 +318,9 @@ so, subject to the following conditions:
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
 CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
 SOFTWARE.
+

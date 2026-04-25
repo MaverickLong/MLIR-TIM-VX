@@ -1,0 +1,6 @@
+[submodule "TIM-VX"]
+	path = TIM-VX
+	url = https://github.com/VeriSilicon/TIM-VX.git
+[submodule "llvm-project"]
+	path = llvm-project
+	url = https://github.com/llvm/llvm-project.git
