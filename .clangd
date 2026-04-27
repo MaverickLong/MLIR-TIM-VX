@@ -1,0 +1,30 @@
+# clangd configuration for MLIR-TIM-VX.
+# https://clangd.llvm.org/config
+#
+# This file claims everything under $PROJECT_ROOT EXCEPT the
+# llvm-project/ subtree, which has its own .clangd.
+
+CompileFlags:
+  CompilationDatabase: build/
+
+  Add:
+    # Project's own headers
+    - -I/home/radxa/MLIR-TIM-VX/include
+    # Project's TableGen-generated headers
+    - -I/home/radxa/MLIR-TIM-VX/build/include
+    # LLVM/MLIR source headers
+    - -I/home/radxa/MLIR-TIM-VX/llvm-project/llvm/include
+    - -I/home/radxa/MLIR-TIM-VX/llvm-project/mlir/include
+    # LLVM/MLIR generated headers
+    - -I/home/radxa/MLIR-TIM-VX/llvm-project/build/include
+    - -I/home/radxa/MLIR-TIM-VX/llvm-project/build/tools/mlir/include
+
+  Remove:
+    - -Werror=*
+    - -fno-canonical-system-headers
+    - -mfp16-format=*
+
+Diagnostics:
+  Suppress:
+    - drv_unknown_argument
+    - unused-parameter
