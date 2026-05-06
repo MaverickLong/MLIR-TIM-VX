@@ -48,6 +48,12 @@ def TIMVX_PoolTypeAttr : I32EnumAttr<"PoolType",
 // Constant ops
 //===----------------------------------------------------------------------===//
 
+// Convention for the optional quant attrs scattered on tensor-producing ops:
+//   `*_scale` is F64Attr (matches mlir::quant::UniformQuantizedType's `double`
+//   scale).  `*_zp` is I64Attr (storage-width-agnostic).  When both are set,
+//   the EmitC pattern emits `Quantization(ASYMMETRIC, scale, zp)` on the
+//   corresponding TensorSpec.
+
 def TIMVX_ConstOp : TIMVX_Op<"const", [
         ConstantLike, Pure,
         AllShapesMatch<["values", "output"]>,
@@ -60,7 +66,11 @@ def TIMVX_ConstOp : TIMVX_Op<"const", [
     the provided data.
   }];
 
-  let arguments = (ins ElementsAttr:$values);
+  let arguments = (ins
+      ElementsAttr:$values,
+      OptionalAttr<F64Attr>:$quant_scale,
+      OptionalAttr<I64Attr>:$quant_zp
+  );
   let results = (outs TIMVX_Tensor:$output);
   let hasFolder = 1;
 }
@@ -105,16 +115,18 @@ def TIMVX_ClipOp : TIMVX_FuncTypeOp<"clip", [
 //===----------------------------------------------------------------------===//
 
 def TIMVX_Conv2DOp : TIMVX_FuncTypeOp<"conv2d", [Pure]> {
-  let summary = "2-D convolution (NHWC input, OHWI weight).";
+  let summary = "2-D convolution (WHCN input, WHIcOc weight).";
   let description = [{
-    Performs 2-D convolution. Input is rank-4 NHWC; weight is rank-4 OHWI;
+    Performs 2-D convolution. Input is rank-4 WHCN; weight is rank-4 WHIcOc;
     bias is rank-1.
 
-    Pad order: [top, bottom, left, right].
-    Stride / dilation order: [h, w].
+    Pad order: [left, right, top, bottom].
+    Stride / dilation order: [W, H].
 
     Lowers to tim::vx::ops::Conv2d with constant pad / stride / dilation
-    arrays and DataLayout::CWHN (input) / DataLayout::IcWHOc (kernel).
+    arrays. TIM-VX defaults (DataLayout::WHCN input / DataLayout::WHIcOc
+    kernel) match the IR-side layout, so no explicit layout argument is
+    passed.
   }];
 
   let arguments = (ins
@@ -122,9 +134,14 @@ def TIMVX_Conv2DOp : TIMVX_FuncTypeOp<"conv2d", [Pure]> {
       TIMVX_Tensor:$weight,
       TIMVX_Tensor:$bias,
 
-      DenseI64ArrayAttr:$pad,            // [top, bottom, left, right]
-      DenseI64ArrayAttr:$stride,         // [h, w]
-      DenseI64ArrayAttr:$dilation        // [h, w]
+      DenseI64ArrayAttr:$pad,            // [left, right, top, bottom]
+      DenseI64ArrayAttr:$stride,         // [W, H]
+      DenseI64ArrayAttr:$dilation,       // [W, H]
+
+      // Optional output Quantization. When set, the result tensor's
+      // TensorSpec is emitted with Quantization(ASYMMETRIC, scale, zp).
+      OptionalAttr<F64Attr>:$output_scale,
+      OptionalAttr<I64Attr>:$output_zp
   );
   let results = (outs TIMVX_Tensor:$output);
 }
@@ -143,25 +160,50 @@ def TIMVX_MatMulOp : TIMVX_FuncTypeOp<"matmul", [NoMemoryEffect]> {
   let results = (outs TIMVX_Tensor:$output);
 }
 
+def TIMVX_FullyConnectedOp : TIMVX_FuncTypeOp<"fully_connected", [Pure]> {
+  let summary = "Fully-connected (dense) layer: Y = X @ Wt + b.";
+  let description = [{
+    Computes `output = input @ weight^T + bias`. Input is rank-2
+    [batch, in_features]; weight is rank-2 [out_features, in_features];
+    bias is rank-1 [out_features]. Lowers to tim::vx::ops::FullyConnected
+    with axis=1 (input is already coerced to 2-D, dim 1 onward = features).
+  }];
+
+  let arguments = (ins
+      TIMVX_Tensor:$input,
+      TIMVX_Tensor:$weight,
+      TIMVX_Tensor:$bias,
+
+      OptionalAttr<F64Attr>:$output_scale,
+      OptionalAttr<I64Attr>:$output_zp
+  );
+  let results = (outs TIMVX_Tensor:$output);
+}
+
 def TIMVX_Pool2DOp : TIMVX_FuncTypeOp<"pool2d", [Pure]> {
   let summary = "2-D pooling (MAX / AVG / L2 / AVG_ANDROID).";
   let description = [{
-    2-D pooling over a spatial window. Input is rank-4 NHWC.
+    2-D pooling over a spatial window. Input is rank-4 WHCN.
     This single op covers all tim::vx::PoolType variants (MAX /
     AVG / L2 / AVG_ANDROID). Pool kind is selected by `pool_type`.
 
-    Pad order: [top, bottom, left, right]. Stride / kernel order: [h, w].
+    Pad order: [left, right, top, bottom]. Stride / kernel order: [W, H].
 
-    Lowers to tim::vx::ops::Pool2d with the given PoolType,
-    RoundType::FLOOR, and DataLayout::CWHN.
+    Lowers to tim::vx::ops::Pool2d with the given PoolType and
+    RoundType::FLOOR. TIM-VX defaults to DataLayout::WHCN, which matches
+    the IR-side layout, so no explicit layout argument is passed.
   }];
 
   let arguments = (ins
       TIMVX_Tensor:$input,
       TIMVX_PoolTypeAttr:$pool_type,
-      DenseI64ArrayAttr:$kernel,         // [h, w]
-      DenseI64ArrayAttr:$stride,         // [h, w]
-      DenseI64ArrayAttr:$pad             // [top, bottom, left, right]
+      DenseI64ArrayAttr:$kernel,         // [W, H]
+      DenseI64ArrayAttr:$stride,         // [W, H]
+      DenseI64ArrayAttr:$pad,            // [left, right, top, bottom]
+
+      // Pool doesn't change the quant params; input and output share these.
+      OptionalAttr<F64Attr>:$output_scale,
+      OptionalAttr<I64Attr>:$output_zp
   );
   let results = (outs TIMVX_Tensor:$output);
 }
@@ -270,7 +312,14 @@ def TIMVX_ReshapeOp : TIMVX_FuncTypeOp<"reshape", [Pure]> {
 
   let arguments = (ins
       TIMVX_Tensor:$input1,
-      1DTensorOf<[Index]>:$shape
+      1DTensorOf<[Index]>:$shape,
+
+      // Reshape preserves quant: output mirrors input's params. Set when
+      // the value is on the quant int8 chain so the produced TIM-VX
+      // tensor binds with matching Quantization() (TIM-VX's op_check
+      // refuses to wire a tensor with quant set into one without).
+      OptionalAttr<F64Attr>:$output_scale,
+      OptionalAttr<I64Attr>:$output_zp
   );
   let results = (outs TIMVX_Tensor:$output);
 }
@@ -286,7 +335,10 @@ def TIMVX_SliceOp : TIMVX_FuncTypeOp<"slice", [Pure]> {
   let arguments = (ins
       TIMVX_Tensor:$input1,
       1DTensorOf<[Index]>:$start,
-      1DTensorOf<[Index]>:$size
+      1DTensorOf<[Index]>:$size,
+
+      OptionalAttr<F64Attr>:$output_scale,
+      OptionalAttr<I64Attr>:$output_zp
   );
   let results = (outs TIMVX_Tensor:$output);
 }
@@ -304,7 +356,77 @@ def TIMVX_TransposeOp : TIMVX_FuncTypeOp<"transpose", [
 
   let arguments = (ins
       TIMVX_Tensor:$input1,
-      DenseI32ArrayAttr:$perms
+      DenseI32ArrayAttr:$perms,
+
+      OptionalAttr<F64Attr>:$output_scale,
+      OptionalAttr<I64Attr>:$output_zp
+  );
+  let results = (outs TIMVX_Tensor:$output);
+}
+
+//===----------------------------------------------------------------------===//
+// Quant / dtype helpers
+//===----------------------------------------------------------------------===//
+
+def TIMVX_ReduceSumOp : TIMVX_FuncTypeOp<"reduce_sum", [Pure]> {
+  let summary = "Sum-reduce along one axis (or many).";
+  let description = [{
+    Lowers to tim::vx::ops::ReduceSum. Used to handle the post-residual
+    spatial sum that quantized TOSA emits in fp32 (paired with multiply by
+    `1/N` for an avg pool).
+  }];
+
+  let arguments = (ins
+      TIMVX_Tensor:$input,
+      DenseI32ArrayAttr:$axes,    // axis indices to reduce over
+      BoolAttr:$keep_dims
+  );
+  let results = (outs TIMVX_Tensor:$output);
+}
+
+def TIMVX_DataConvertOp : TIMVX_FuncTypeOp<"dataconvert", [
+        Pure,
+        SameOperandsAndResultShape
+    ]> {
+  let summary = "Change tensor dtype, optionally requantizing.";
+  let description = [{
+    Lowers to tim::vx::ops::DataConvert. With matching quant params on the
+    input and output specs, this acts as a requantize; otherwise it is a
+    pure dtype convert. Used to lower `tosa.cast` and the int8 quantize /
+    dequantize boundaries that quantized TOSA emits explicitly.
+  }];
+
+  let arguments = (ins
+      TIMVX_Tensor:$input,
+      OptionalAttr<F64Attr>:$output_scale,
+      OptionalAttr<I64Attr>:$output_zp
+  );
+  let results = (outs TIMVX_Tensor:$output);
+}
+
+def TIMVX_PadOp : TIMVX_FuncTypeOp<"pad", [Pure]> {
+  let summary = "Pad with a constant value (typically the input zero-point).";
+  let description = [{
+    Pads `input` along each spatial axis with `pad_const`. `padding` is a
+    rank-2 i32/i64 tensor with shape [rank, 2] containing
+    [front, back] sizes per dim. Lowers to tim::vx::ops::Pad.
+
+    Quantized models commonly precede a conv2d with this op carrying the
+    input's zero-point as `pad_const` so that the padded region is zero in
+    real-value space.
+  }];
+
+  let arguments = (ins
+      TIMVX_Tensor:$input,
+      // Flat [front_0, back_0, front_1, back_1, ...] with `2 * rank(input)`
+      // entries; matches what `tosa.const_shape` emits after the generic
+      // ConstShape lowering reshapes its !tosa.shape<2N> result.
+      1DTensorOf<[Index]>:$padding,
+      F32Attr:$pad_const,
+
+      // Pad doesn't change the quant params; output mirrors input.
+      OptionalAttr<F64Attr>:$output_scale,
+      OptionalAttr<I64Attr>:$output_zp
   );
   let results = (outs TIMVX_Tensor:$output);
 }

@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -24,7 +25,8 @@ int main(int argc, char **argv) {
 
   mlir::DialectRegistry registry;
   registry.insert<mlir::timvx::TIMVXDialect, mlir::tosa::TosaDialect,
-                  mlir::arith::ArithDialect, mlir::func::FuncDialect>();
+                  mlir::arith::ArithDialect, mlir::func::FuncDialect,
+                  mlir::emitc::EmitCDialect>();
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "TIM-VX Bridge Driver\n", registry));
