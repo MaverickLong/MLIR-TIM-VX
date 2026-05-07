@@ -1,0 +1,5 @@
+{
+  "permissions": {
+    "allow": ["Bash(cmake --build build --target mlir-timvx-opt)", "Bash(*)"]
+  }
+}

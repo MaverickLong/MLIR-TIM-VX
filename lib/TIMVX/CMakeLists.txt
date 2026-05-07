@@ -14,8 +14,10 @@ add_mlir_dialect_library(MLIRTIMVX
 
         LINK_LIBS PUBLIC
         MLIRIR
+        MLIREmitCDialect
         MLIRInferTypeOpInterface
         MLIRFuncDialect
+        MLIRFuncTransforms
         MLIRQuantDialect
         MLIRTosaDialect
         MLIRTransformUtils

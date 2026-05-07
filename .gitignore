@@ -1,6 +1,9 @@
 # Build Files
 build/
 *.draft
+.deprecated
+.build
+debug_scripts/lower_out
 
 # MLIR Intermediate Assemblies
 *.mlir

@@ -18,7 +18,13 @@ namespace timvx {
 
 // Forward-declared so the .td-generated `Base<>` can reference it as the
 // pass's constructor (see `let constructor = ...` in TIMVXPasses.td).
+std::unique_ptr<Pass> createTosaLayoutTagPass();
+std::unique_ptr<Pass> createTosaLayoutToWhcnPass();
+std::unique_ptr<Pass> createTosaConstFoldPass();
 std::unique_ptr<Pass> createTosaToTIMVXPass();
+std::unique_ptr<Pass> createTosaFoldAvgPoolReducePass();
+std::unique_ptr<Pass> createTIMVXConv1x1ToFCPass();
+std::unique_ptr<Pass> createTIMVXToEmitCPass();
 
 #define GEN_PASS_DECL
 #include "TIMVX/TIMVXPasses.h.inc"
