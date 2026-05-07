@@ -4,6 +4,8 @@ build/
 .deprecated
 .build
 debug_scripts/lower_out
+*lower_out*
+.claude
 
 # MLIR Intermediate Assemblies
 *.mlir
