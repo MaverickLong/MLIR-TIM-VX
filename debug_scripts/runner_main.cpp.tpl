@@ -21,6 +21,7 @@
 //      min/max/mean to stdout.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -142,6 +143,14 @@ void print_output(const std::shared_ptr<tim::vx::Tensor>& t) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Disable stdout buffering. When the runner is launched as a child of
+  // run_sample.py (subprocess.run with no PIPE), stdout is fully
+  // buffered if it points at anything other than a TTY — and libGAL /
+  // OVXLIB writes go to stderr, so a process abort mid-way can lose all
+  // of our buffered diagnostic output. Make stdout unbuffered so each
+  // [stage] line appears immediately.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+
   if (argc != static_cast<int>(kInputs.size()) + 1) {
     std::fprintf(stderr, "usage: %s", argv[0]);
     for (size_t i = 0; i < kInputs.size(); ++i)
@@ -183,17 +192,72 @@ int main(int argc, char** argv) {
     inputs.push_back(t);
   }
 
-  auto output = __FUNC_NAME__(graph, __INPUT_ARGS__);
+  // Stage markers + timing. We flush after every print because libGAL
+  // and the OVXLIB log layer can reorder buffered output otherwise; if
+  // `Compile()` aborts mid-way, an unflushed "[stage] compiling" line
+  // can be lost. Wall-clock is fine for an order-of-magnitude read.
+  using Clock = std::chrono::steady_clock;
+  auto ms_since = [](Clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  };
 
+  // Cheap peak-RSS sampler. Compile-time memory usage by libCLC / the
+  // EVIS shader cache can spike non-monotonically — a leaky JIT path
+  // shows up as the per-stage delta blowing past expected runtime
+  // tensor sizes. Reads /proc/self/status' VmHWM line (high-water mark).
+  auto rss_kb = []() -> long {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line))
+      if (line.rfind("VmHWM:", 0) == 0)
+        return std::strtol(line.c_str() + 6, nullptr, 10);
+    return -1;
+  };
+  auto stage = [&](const char* tag, double ms) {
+    long rss = rss_kb();
+    if (rss >= 0)
+      std::printf("[stage] %s in %.2f ms (peak RSS %.1f MiB)\n",
+                  tag, ms, rss / 1024.0);
+    else
+      std::printf("[stage] %s in %.2f ms\n", tag, ms);
+    std::fflush(stdout);
+  };
+
+  std::printf("[stage] building graph\n"); std::fflush(stdout);
+  auto t_build = Clock::now();
+  auto output = __FUNC_NAME__(graph, __INPUT_ARGS__);
+  double build_ms = ms_since(t_build);
+  stage("graph built", build_ms);
+
+  std::printf("[stage] compiling\n"); std::fflush(stdout);
+  auto t_compile = Clock::now();
   if (!graph->Compile()) {
     std::fprintf(stderr, "graph->Compile failed\n");
     return 3;
   }
+  double compile_ms = ms_since(t_compile);
+  stage("compile done", compile_ms);
+
+  std::printf("[stage] running inference\n"); std::fflush(stdout);
+  auto t_run = Clock::now();
   if (!graph->Run()) {
-    std::fprintf(stderr, "graph->Run failed\n");
-    return 3;
+    std::fprintf(stderr, "graph->Run failed after %.2f ms\n", ms_since(t_run));
+    std::fflush(stderr);
+    // Skip the C++ destructor chain. tim::vx::Context / Graph dtors
+    // block on libGAL command-queue teardown, and a failed Run() can
+    // leave commands in flight that the dtor never reaps — observed
+    // hang requiring two Ctrl+C's. _exit bypasses cleanup; the kernel
+    // reaps the GPU FDs.
+    std::_Exit(3);
   }
+  double run_ms = ms_since(t_run);
+  stage("run done", run_ms);
 
   print_output(output);
+  std::fflush(stdout);
+
+  std::printf("[summary] build=%.2fms compile=%.2fms run=%.2fms\n",
+              build_ms, compile_ms, run_ms);
+  std::fflush(stdout);
   return 0;
 }

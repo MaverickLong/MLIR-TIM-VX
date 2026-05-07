@@ -57,7 +57,9 @@ namespace timvx {
 #define GEN_PASS_DEF_TOSALAYOUTTAGPASS
 #define GEN_PASS_DEF_TOSALAYOUTTOWHCNPASS
 #define GEN_PASS_DEF_TOSACONSTFOLDPASS
+#define GEN_PASS_DEF_TOSAFOLDAVGPOOLREDUCEPASS
 #define GEN_PASS_DEF_TOSATOTIMVXPASS
+#define GEN_PASS_DEF_TIMVXCONV1X1TOFCPASS
 #define GEN_PASS_DEF_TIMVXTOEMITCPASS
 #include "TIMVX/TIMVXPasses.h.inc"
 
@@ -687,30 +689,37 @@ struct Conv2DOpConversion : public OpConversionPattern<tosa::Conv2DOp> {
 
 /// pool2d rewrites. nan_mode / acc_type dropped
 struct MaxPool2DConversion : public OpConversionPattern<tosa::MaxPool2dOp> {
-  using OpConversionPattern<tosa::MaxPool2dOp>::OpConversionPattern;
+  MaxPool2DConversion(MLIRContext *ctx, const QuantInfoMap &qm)
+      : OpConversionPattern(ctx), quantInfo(qm) {}
+  const QuantInfoMap &quantInfo;
   LogicalResult
   matchAndRewrite(tosa::MaxPool2dOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
+    auto [s, z] = qmapAttrs(quantInfo, op.getResult(), rewriter);
     rewriter.replaceOpWithNewOp<Pool2DOp>(
         op, op.getType(), adaptor.getInput(), PoolType::MAX,
         adaptor.getKernelAttr(), adaptor.getStrideAttr(), op.getPadAttr(),
-        /*output_scale=*/FloatAttr{}, /*output_zp=*/IntegerAttr{});
+        s, z);
     return success();
   }
 };
 struct AvgPool2DConversion : public OpConversionPattern<tosa::AvgPool2dOp> {
-  using OpConversionPattern<tosa::AvgPool2dOp>::OpConversionPattern;
+  AvgPool2DConversion(MLIRContext *ctx, const QuantInfoMap &qm)
+      : OpConversionPattern(ctx), quantInfo(qm) {}
+  const QuantInfoMap &quantInfo;
   LogicalResult
   matchAndRewrite(tosa::AvgPool2dOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
-    if (!isConstantZero(op.getInputZp()))
-      return rewriter.notifyMatchFailure(op, "non-zero input zero-point");
-    if (!isConstantZero(op.getOutputZp()))
-      return rewriter.notifyMatchFailure(op, "non-zero output zero-point");
+    // For a quantized avg-pool, input_zp == output_zp must hold (avg is
+    // linear in real-value space, so the zp passes through). We don't
+    // assert that here — the upstream peephole that emits this op
+    // already chooses the same zp on both sides; for hand-written TOSA
+    // the user's responsibility.
+    auto [s, z] = qmapAttrs(quantInfo, op.getResult(), rewriter);
     rewriter.replaceOpWithNewOp<Pool2DOp>(
         op, op.getType(), adaptor.getInput(), PoolType::AVG,
         adaptor.getKernelAttr(), adaptor.getStrideAttr(), op.getPadAttr(),
-        /*output_scale=*/FloatAttr{}, /*output_zp=*/IntegerAttr{});
+        s, z);
     return success();
   }
 };
@@ -863,18 +872,34 @@ static void buildQuantInfoMap(func::FuncOp f, QuantInfoMap &qm) {
       return;
     }
     // Layout-/range-preserving ops: result inherits operand quant.
-    if (isa<tosa::MaxPool2dOp, tosa::PadOp, tosa::TransposeOp,
-            tosa::ReshapeOp, tosa::SliceOp>(op)) {
+    // (Avg pool is linear in real-value space — quant passes through
+    // unchanged — provided input_zp == output_zp on the tosa op, which
+    // the AvgPoolReduceFold rewriter guarantees.)
+    if (isa<tosa::MaxPool2dOp, tosa::AvgPool2dOp, tosa::PadOp,
+            tosa::TransposeOp, tosa::ReshapeOp, tosa::SliceOp>(op)) {
       if (op->getNumOperands() < 1 || op->getNumResults() != 1) return;
       auto qi = qm.lookup(op->getOperand(0));
       if (qi) qm.set(op->getResult(0), *qi);
       return;
     }
-    // tosa.cast: drops quant (i8 → f32 dequant cast, or f32 → i8/i32
-    // requantize cast). The downstream fp32 path uses its own constants
-    // for dequantization; the i8-output cast (if any) would need its own
-    // (S, Z) derivation — but our user's TOSA always rescales rather
-    // than casting back to i8, so leave unmapped for now.
+    // tosa.cast: drops quant in general (the i8→f32 dequant cast, or
+    // f32→i32 intermediate cast inside the requantize chain). The one
+    // exception is the *final* requantize cast — `tosa.cast f32 →
+    // narrow-int` produced by RequantI32SkipFold — which the peephole
+    // tags with `timvx.output_scale` / `timvx.output_zp` discardable
+    // attrs encoding the (output_scale, output_zp) pair the downstream
+    // conv2d expects on its input. Without reading these here, the cast
+    // result would land in the IR with no quant, the EmitC path would
+    // build an INT8 spec without Quantization(), and the next conv2d
+    // would receive a no-quant tensor (kernel rejects it).
+    if (auto cast = dyn_cast<tosa::CastOp>(op)) {
+      auto scaleAttr = cast->getAttrOfType<FloatAttr>("timvx.output_scale");
+      auto zpAttr = cast->getAttrOfType<IntegerAttr>("timvx.output_zp");
+      if (scaleAttr && zpAttr)
+        qm.set(cast.getResult(),
+               {scaleAttr.getValueAsDouble(), zpAttr.getInt()});
+      return;
+    }
   });
 }
 
@@ -962,12 +987,18 @@ struct RescaleConvFusion : public OpConversionPattern<tosa::RescaleOp> {
   }
 };
 
-// `tosa.cast` -> `timvx.dataconvert`. TIM-VX's DataConvert ignores the
-// scale/zp metadata of its tensors and just performs a numerical dtype
-// conversion, which matches TOSA's cast semantics. We forward (scale, zp)
-// from the QuantInfoMap to the result spec when available so the produced
-// tensor still binds with proper Quantization, even though the conversion
-// itself is value-preserving.
+// `tosa.cast` -> `timvx.cast`. TIM-VX's Cast is the value-cast op (it
+// dispatches to the GPU `cast` kernel, ignores scale/zp on either end
+// for the cast itself). DataConvert is NOT used here — on this chip the
+// `vivante.nn.tensorcopy` path COMPILE_FAILs for every f32→int direction,
+// even when the upstream op_check table allows it. Cast handles all the
+// pairs the residual quantize chain needs: f32→i32 raw, f32→i8|asym,
+// i32 raw→i8|asym, plus the corresponding dequantize directions.
+//
+// We forward (scale, zp) from the QuantInfoMap to the result spec when
+// available so the produced tensor still binds with proper Quantization
+// metadata for downstream ops, even though the cast itself is
+// value-preserving.
 struct CastConversion : public OpConversionPattern<tosa::CastOp> {
   CastConversion(MLIRContext *ctx, const QuantInfoMap &qm)
       : OpConversionPattern(ctx), quantInfo(qm) {}
@@ -981,8 +1012,8 @@ struct CastConversion : public OpConversionPattern<tosa::CastOp> {
       scale = rewriter.getF64FloatAttr(qi->scale);
       zp = rewriter.getI64IntegerAttr(qi->zp);
     }
-    rewriter.replaceOpWithNewOp<DataConvertOp>(op, op.getType(),
-                                                adaptor.getInput(), scale, zp);
+    rewriter.replaceOpWithNewOp<CastOp>(op, op.getType(),
+                                         adaptor.getInput(), scale, zp);
     return success();
   }
 };
@@ -1209,6 +1240,142 @@ struct PadFoldIntoConv : public OpRewritePattern<tosa::PadOp> {
   }
 };
 
+// Skip the i32 detour in TOSA's quantize-tail decomposition. The chain
+// TOSA's rescale lowering emits is:
+//
+//   %a   = tosa.mul %x, %inv_scale_f32, %shift   : f32   (1/output_scale)
+//   %b   = tosa.cast %a   : f32 → i32
+//   %z   = tosa.const dense<zp_int>              : i32   (rank-0 / broadcast)
+//   %c   = tosa.add %b, %z                       : i32
+//   %out = tosa.cast %c   : i32 → i8 (or u8/i16) : narrow int
+//
+// On VIP9000Nano-DI plain int32 is a near-dead column (Add/Sub/Mul/Pow/Rcp,
+// Reshape/Slice, Pool/Conv/Matmul/FC all COMPILE_FAIL — see the i32
+// column of the matrix in project_a733_fp32_conv_unsupported.md). The
+// equivalent fp32 form runs end-to-end on supported kernels:
+//
+//   %z_f = tosa.const dense<float(zp_int)>       : f32   (same shape as %z)
+//   %c_f = tosa.add %a, %z_f                     : f32
+//   %out = tosa.cast %c_f : f32 → narrow int
+//
+// `Cast f32 → i8|asym` does saturate(round(input)), which equals the
+// pre-existing chain's behavior because %a was already produced as
+// `(s * 1/scale)`: adding zp in fp32 then truncating gives the same
+// narrow-int values as casting to i32, adding zp, then truncating.
+//
+// We also recover the (output_scale, output_zp) pair here and stash
+// them on the new `tosa.cast` as discardable `timvx.output_scale` /
+// `timvx.output_zp` attributes. `buildQuantInfoMap` reads those attrs
+// so `CastConversion` can attach the right Quantization() to the
+// downstream tensor spec — without them, the i8 result feeding into
+// the next conv2d would have no quant info on the operand spec.
+struct RequantI32SkipFold : public OpRewritePattern<tosa::CastOp> {
+  using OpRewritePattern<tosa::CastOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(tosa::CastOp castOut,
+                                 PatternRewriter &rewriter) const final {
+    auto srcTy = dyn_cast<RankedTensorType>(castOut.getInput().getType());
+    auto dstTy = dyn_cast<RankedTensorType>(castOut.getType());
+    if (!srcTy || !dstTy) return failure();
+    if (!srcTy.getElementType().isInteger(32)) return failure();
+    auto dstInt = dyn_cast<IntegerType>(dstTy.getElementType());
+    if (!dstInt || dstInt.getWidth() >= 32) return failure();
+
+    auto add = castOut.getInput().getDefiningOp<tosa::AddOp>();
+    if (!add || !add->hasOneUse()) return failure();
+
+    // Identify the (cast-from-f32-to-i32) operand and the (i32 zp const)
+    // operand of the inner add.
+    auto isI32CastFromF32 = [](Value v, tosa::CastOp &out) {
+      auto c = v.getDefiningOp<tosa::CastOp>();
+      if (!c) return false;
+      auto in = dyn_cast<RankedTensorType>(c.getInput().getType());
+      auto outT = dyn_cast<RankedTensorType>(c.getType());
+      if (!in || !outT) return false;
+      if (!in.getElementType().isF32()) return false;
+      if (!outT.getElementType().isInteger(32)) return false;
+      out = c;
+      return true;
+    };
+    tosa::CastOp innerCast;
+    Value zpSide;
+    if (isI32CastFromF32(add.getInput1(), innerCast)) zpSide = add.getInput2();
+    else if (isI32CastFromF32(add.getInput2(), innerCast)) zpSide = add.getInput1();
+    else return failure();
+    if (!innerCast->hasOneUse()) return failure();
+
+    // Read zp (must be constant; broadcast-shaped is fine — we'll reuse the
+    // shape for the f32 replacement).
+    auto zpConst = zpSide.getDefiningOp<tosa::ConstOp>();
+    if (!zpConst) return failure();
+    auto zpAttr = dyn_cast<DenseIntElementsAttr>(zpConst.getValuesAttr());
+    if (!zpAttr || !zpAttr.getElementType().isInteger(32)) return failure();
+    auto zpTy = dyn_cast<RankedTensorType>(zpConst.getType());
+    if (!zpTy || zpAttr.getNumElements() < 1) return failure();
+    int64_t zpScalar =
+        (*zpAttr.getValues<APInt>().begin()).getSExtValue();
+
+    // Read the upstream multiplier const (the `1/output_scale` factor) so
+    // we can derive the output scale that downstream conv2d expects on
+    // its input. The mul operand can be either input — try both.
+    auto mul = innerCast.getInput().getDefiningOp<tosa::MulOp>();
+    std::optional<double> invScale;
+    Value mulValue;
+    if (mul) {
+      auto tryConst = [&](Value v) -> std::optional<double> {
+        auto view = getConstF32(v);
+        if (!view || view->data.empty()) return std::nullopt;
+        return static_cast<double>(view->data[0]);
+      };
+      if ((invScale = tryConst(mul.getInput2()))) {
+        mulValue = mul.getInput1();
+      } else if ((invScale = tryConst(mul.getInput1()))) {
+        mulValue = mul.getInput2();
+      }
+    }
+    // The peephole's correctness doesn't depend on recovering invScale —
+    // we'll still rewrite the chain. We only skip the `output_scale`
+    // attribute when invScale isn't available, which leaves the cast
+    // result untagged and falls back to the existing CastConversion
+    // path's quant-less spec. (Practically every chain we lower has the
+    // const operand, so this should always succeed.)
+    (void)mulValue;
+
+    // Build f32 const with the same shape; value-cast each i32 element to
+    // f32. zp is small so the cast is exact.
+    SmallVector<float> zpFp;
+    zpFp.reserve(zpAttr.getNumElements());
+    for (APInt v : zpAttr.getValues<APInt>())
+      zpFp.push_back(static_cast<float>(v.getSExtValue()));
+    auto f32 = rewriter.getF32Type();
+    auto zpFpTy = RankedTensorType::get(zpTy.getShape(), f32);
+    auto zpFpConst = tosa::ConstOp::create(
+        rewriter, zpConst.getLoc(), zpFpTy,
+        DenseElementsAttr::get(zpFpTy, ArrayRef<float>(zpFp)));
+
+    // f32 add (same shape as the original i32 add result).
+    auto i32AddTy = dyn_cast<RankedTensorType>(add.getType());
+    if (!i32AddTy) return failure();
+    auto fAddTy = RankedTensorType::get(i32AddTy.getShape(), f32);
+    auto newAdd = tosa::AddOp::create(rewriter, add.getLoc(), fAddTy,
+                                       innerCast.getInput(),
+                                       zpFpConst.getResult());
+
+    // Final cast: replaces the outer i32 → narrow-int cast with a f32 →
+    // narrow-int cast. Stash output_scale / output_zp as discardable
+    // attrs so buildQuantInfoMap can pick them up.
+    auto newCast = tosa::CastOp::create(rewriter, castOut.getLoc(), dstTy,
+                                         newAdd.getResult());
+    if (invScale && *invScale != 0.0) {
+      double scale = 1.0 / *invScale;
+      newCast->setAttr("timvx.output_scale", rewriter.getF64FloatAttr(scale));
+      newCast->setAttr("timvx.output_zp",
+                        rewriter.getI64IntegerAttr(zpScalar));
+    }
+    rewriter.replaceOp(castOut, newCast.getResult());
+    return success();
+  }
+};
+
 }; // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1220,8 +1387,8 @@ struct TosaConstFoldPass
   void runOnOperation() final {
     RewritePatternSet patterns(&getContext());
     patterns.add<AddConstFold, SubConstFold, MulConstFold, PowConstFold,
-                 ReciprocalConstFold, ReshapeConstFold, PadFoldIntoConv>(
-        &getContext());
+                 ReciprocalConstFold, ReshapeConstFold, PadFoldIntoConv,
+                 RequantI32SkipFold>(&getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       signalPassFailure();
   }
@@ -1229,6 +1396,238 @@ struct TosaConstFoldPass
 
 std::unique_ptr<Pass> createTosaConstFoldPass() {
   return std::make_unique<TosaConstFoldPass>();
+}
+
+//===----------------------------------------------------------------------===//
+// tosa-fold-avgpool-reduce
+//===----------------------------------------------------------------------===//
+//
+// Replace `cast(scale * sum(x)/N + zp)` (the global avg-pool emitted by
+// tflite as a `reduce_sum × 2 → mul(1/N) → requant tail`) with
+// `avg_pool2d(cast(scale * x + zp))` so the average runs as a single
+// Pool2D AVG kernel on u8 instead of 14 unique slice/add shaders. See
+// the pass description in TIMVXPasses.td for why this is needed.
+
+namespace {
+
+// Read a scalar fp32 value from a `tosa.const`. Used to recognize the
+// 1/N, scale, and zp constants in the requant chain.
+static std::optional<double> getConstFp32Scalar(Value v) {
+  auto c = v.getDefiningOp<tosa::ConstOp>();
+  if (!c) return std::nullopt;
+  auto attr = dyn_cast<DenseFPElementsAttr>(c.getValuesAttr());
+  if (!attr) return std::nullopt;
+  if (!attr.getElementType().isF32()) return std::nullopt;
+  if (attr.isSplat())
+    return attr.getSplatValue<APFloat>().convertToDouble();
+  if (attr.getNumElements() == 1)
+    return (*attr.getValues<APFloat>().begin()).convertToDouble();
+  return std::nullopt;
+}
+
+// Pick out the (variable, scalar-const) operand split for a binary op.
+// Returns {variable_value, scalar_double} on success.
+template <typename BinOp>
+static std::optional<std::pair<Value, double>>
+splitBinaryConstOperand(BinOp op) {
+  Value a = op.getInput1(), b = op.getInput2();
+  if (auto s = getConstFp32Scalar(b)) return {{a, *s}};
+  if (auto s = getConstFp32Scalar(a)) return {{b, *s}};
+  return std::nullopt;
+}
+
+// Match a tosa.cast f32 → narrow_int that carries the
+// `timvx.output_scale` / `timvx.output_zp` discardable attrs deposited
+// by `RequantI32SkipFold` — that's the requant-tail's terminal cast.
+// On match, walk back through:
+//   (cast_terminal) ← add(zp_const) ← mul(scale_const) ← mul(1/N const)
+//   ← reshape ← reduce_sum(W) ← reduce_sum(H) ← <fp32 spatial input>
+//
+// and rewrite to:
+//   <fp32 spatial> → mul(scale) → add(zp) → cast f32→int → avg_pool2d
+//   → reshape (back to the cast_terminal's original output shape).
+struct AvgPoolReduceFold : public OpRewritePattern<tosa::CastOp> {
+  using OpRewritePattern<tosa::CastOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tosa::CastOp castOp,
+                                 PatternRewriter &rewriter) const final {
+    // (1) cast must be the post-RequantI32SkipFold terminal cast: f32 → narrow int
+    //     with our discardable quant attrs.
+    auto srcTy = dyn_cast<RankedTensorType>(castOp.getInput().getType());
+    auto dstTy = dyn_cast<RankedTensorType>(castOp.getType());
+    if (!srcTy || !dstTy) return failure();
+    if (!srcTy.getElementType().isF32()) return failure();
+    auto outI = dyn_cast<IntegerType>(dstTy.getElementType());
+    if (!outI || outI.getWidth() >= 32) return failure();
+    auto castScale = castOp->getAttrOfType<FloatAttr>("timvx.output_scale");
+    auto castZp = castOp->getAttrOfType<IntegerAttr>("timvx.output_zp");
+    if (!castScale || !castZp) return failure();
+
+    // Helper: a chain link is "single-use" iff the producing op's only
+    // consumer is the next link. Bail otherwise — pulling the requant
+    // forward would change semantics for the other consumer.
+    auto onlyUseIs = [](Value v, Operation *user) {
+      return v.hasOneUse() && *v.getUsers().begin() == user;
+    };
+
+    // (2) cast input ← tosa.add %y, zp_const (splat fp32)
+    auto add = castOp.getInput().getDefiningOp<tosa::AddOp>();
+    if (!add) return failure();
+    if (!onlyUseIs(add.getResult(), castOp)) return failure();
+    auto addSplit = splitBinaryConstOperand<tosa::AddOp>(add);
+    if (!addSplit) return failure();
+    auto [addVar, zpVal] = *addSplit;
+
+    // (3) addVar ← tosa.mul %z, scale_const (splat fp32)
+    auto mulScale = addVar.getDefiningOp<tosa::MulOp>();
+    if (!mulScale) return failure();
+    if (!onlyUseIs(mulScale.getResult(), add)) return failure();
+    auto mulScaleSplit = splitBinaryConstOperand<tosa::MulOp>(mulScale);
+    if (!mulScaleSplit) return failure();
+    auto [mulScaleVar, scaleVal] = *mulScaleSplit;
+
+    // (4) mulScaleVar ← tosa.mul %w, inv_n_const (splat fp32 = 1/N)
+    auto mulInvN = mulScaleVar.getDefiningOp<tosa::MulOp>();
+    if (!mulInvN) return failure();
+    if (!onlyUseIs(mulInvN.getResult(), mulScale)) return failure();
+    auto mulInvNSplit = splitBinaryConstOperand<tosa::MulOp>(mulInvN);
+    if (!mulInvNSplit) return failure();
+    auto [mulInvNVar, invNVal] = *mulInvNSplit;
+    if (invNVal <= 0.0) return failure();
+    int64_t expectedN = static_cast<int64_t>(std::llround(1.0 / invNVal));
+    if (expectedN <= 1) return failure();
+    // Sanity-check: 1/N const should round-trip.
+    if (std::abs(invNVal - 1.0 / static_cast<double>(expectedN)) > 1e-6)
+      return failure();
+
+    // (5) Optional reshape (drops singleton dims). Walk through any
+    //     chain of single-use reshapes.
+    Value cur = mulInvNVar;
+    Operation *lastConsumer = mulInvN;
+    while (auto rs = cur.getDefiningOp<tosa::ReshapeOp>()) {
+      if (!onlyUseIs(rs.getResult(), lastConsumer)) return failure();
+      cur = rs.getInput1();
+      lastConsumer = rs;
+    }
+
+    // (6) reduce_sum chain (one or two ops, axes H/W in NHWC).
+    int64_t kernelH = 1, kernelW = 1;
+    SmallVector<tosa::ReduceSumOp> reduces;
+    while (auto rs = cur.getDefiningOp<tosa::ReduceSumOp>()) {
+      if (!onlyUseIs(rs.getResult(), lastConsumer)) return failure();
+      auto inT = dyn_cast<RankedTensorType>(rs.getInput().getType());
+      if (!inT || inT.getRank() != 4) return failure();
+      int axis = static_cast<int>(rs.getAxis());
+      // NHWC: dim 1 = H, dim 2 = W. We don't fold reductions along N or C.
+      if (axis == 1) kernelH *= inT.getDimSize(1);
+      else if (axis == 2) kernelW *= inT.getDimSize(2);
+      else return failure();
+      reduces.push_back(rs);
+      cur = rs.getInput();
+      lastConsumer = rs;
+    }
+    if (reduces.empty()) return failure();
+    if (kernelH * kernelW != expectedN) return failure();
+
+    // (7) `cur` is now the spatial fp32 tensor that the reduce_sum
+    //     chain consumes. Verify shape; rebuild the chain.
+    auto spatialTy = dyn_cast<RankedTensorType>(cur.getType());
+    if (!spatialTy || spatialTy.getRank() != 4 ||
+        !spatialTy.getElementType().isF32())
+      return failure();
+    auto spatialShape = spatialTy.getShape();
+    int64_t batch = spatialShape[0];
+    int64_t H = spatialShape[1], W = spatialShape[2], C = spatialShape[3];
+    if (H != kernelH || W != kernelW) return failure();
+
+    Location loc = castOp.getLoc();
+    Type fp32 = rewriter.getF32Type();
+    Type narrowInt = dstTy.getElementType();
+
+    auto splat4D = [&](double v) {
+      auto ty = RankedTensorType::get({1, 1, 1, 1}, fp32);
+      auto attr = DenseElementsAttr::get(ty, static_cast<float>(v));
+      return tosa::ConstOp::create(rewriter, loc, ty, attr).getResult();
+    };
+
+    // Per-pixel rescale: y = scale * x + zp (still fp32, full spatial).
+    Value perPixelMul = tosa::MulOp::create(
+        rewriter, loc, RankedTensorType::get(spatialShape, fp32),
+        cur, splat4D(scaleVal),
+        /*shift=*/mulScale.getShift());  // reuse the original mul's shift const
+    Value perPixelAdd = tosa::AddOp::create(
+        rewriter, loc, RankedTensorType::get(spatialShape, fp32),
+        perPixelMul, splat4D(zpVal));
+    Value perPixelInt = tosa::CastOp::create(
+        rewriter, loc, RankedTensorType::get(spatialShape, narrowInt),
+        perPixelAdd);
+    // Carry the same quant tags as the original cast — buildQuantInfoMap
+    // will pick them up so downstream conv/FC sees the right input quant.
+    perPixelInt.getDefiningOp()->setAttr("timvx.output_scale", castScale);
+    perPixelInt.getDefiningOp()->setAttr("timvx.output_zp", castZp);
+
+    // tosa.avg_pool2d: kernel = [H, W], stride = [1,1], pad = [0,0,0,0].
+    // Both input_zp and output_zp are passed as scalar tensor<1xT> consts
+    // matching the per-pixel cast's storage type and (i8) zp.
+    auto zpTensorTy = RankedTensorType::get({1}, narrowInt);
+    auto i8ZpVal = static_cast<int8_t>(castZp.getInt());
+    auto inZpAttr = DenseElementsAttr::get(zpTensorTy, ArrayRef<int8_t>{i8ZpVal});
+    Value inZp = tosa::ConstOp::create(rewriter, loc, zpTensorTy, inZpAttr);
+    Value outZp = tosa::ConstOp::create(rewriter, loc, zpTensorTy, inZpAttr);
+
+    auto poolOutTy = RankedTensorType::get({batch, 1, 1, C}, narrowInt);
+    auto kernelAttr = rewriter.getDenseI64ArrayAttr({kernelH, kernelW});
+    auto strideAttr = rewriter.getDenseI64ArrayAttr({1, 1});
+    auto padAttr = rewriter.getDenseI64ArrayAttr({0, 0, 0, 0});
+    Value pooled = tosa::AvgPool2dOp::create(
+        rewriter, loc, poolOutTy, perPixelInt, inZp, outZp,
+        kernelAttr, strideAttr, padAttr,
+        /*acc_type=*/TypeAttr::get(rewriter.getI32Type()));
+
+    // Reshape pool result back to the original cast result's shape
+    // (typically `[batch, C]` after the user's intermediate reshapes).
+    auto finalTy = castOp.getType();
+    auto finalShape = cast<RankedTensorType>(finalTy).getShape();
+    auto shapeTy = RankedTensorType::get(
+        {static_cast<int64_t>(finalShape.size())}, rewriter.getIndexType());
+    SmallVector<APInt> shapeInts;
+    shapeInts.reserve(finalShape.size());
+    for (int64_t d : finalShape)
+      shapeInts.emplace_back(64, static_cast<uint64_t>(d), /*isSigned=*/true);
+    Value shapeConst = tosa::ConstShapeOp::create(
+        rewriter, loc,
+        tosa::shapeType::get(rewriter.getContext(),
+                              static_cast<int64_t>(finalShape.size())),
+        DenseIntElementsAttr::get(shapeTy, shapeInts));
+    Value reshaped = tosa::ReshapeOp::create(rewriter, loc, finalTy,
+                                               pooled, shapeConst);
+
+    rewriter.replaceOp(castOp, reshaped);
+    return success();
+  }
+};
+
+struct TosaFoldAvgPoolReducePass
+    : public impl::TosaFoldAvgPoolReducePassBase<TosaFoldAvgPoolReducePass> {
+  void runOnOperation() final {
+    RewritePatternSet patterns(&getContext());
+    patterns.add<AvgPoolReduceFold>(&getContext());
+    GreedyRewriteConfig cfg;
+    // Same reasoning as TIMVXConv1x1ToFCPass: greedy folding +
+    // constant-CSE re-materializes constants through the dialect's
+    // `materializeConstant` hook, which can drop the discardable
+    // `timvx.output_scale` / `timvx.output_zp` attrs we depend on.
+    cfg.enableFolding(false);
+    cfg.enableConstantCSE(false);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns), cfg)))
+      signalPassFailure();
+  }
+};
+
+} // namespace
+
+std::unique_ptr<Pass> createTosaFoldAvgPoolReducePass() {
+  return std::make_unique<TosaFoldAvgPoolReducePass>();
 }
 
 //===----------------------------------------------------------------------===//
@@ -1488,6 +1887,23 @@ static void propagateThrough(Operation *op, LayoutInferenceCtx &ctx) {
   // layout passthrough.
   if (auto cast = dyn_cast<tosa::CastOp>(op)) {
     SmallVector<Value, 2> vs{cast.getInput(), cast.getResult()};
+    Layout primary = pickPrimary(vs, ctx);
+    if (primary.empty())
+      return;
+    for (Value v : vs)
+      if (!ctx.layouts.contains(v))
+        ctx.tag(v, primary);
+    return;
+  }
+  // tosa.slice: shape-changing in extent only — per-axis role is
+  // preserved (W stays W, H stays H, etc.), just the dim sizes shrink.
+  // Layout passes through input → result. The start/size const operands
+  // are not feature maps and are tagged separately by the
+  // layout-to-whcn pass. Without this, slice's input would be untagged
+  // and Phase 5 would insert a boundary NHWC→WHCN transpose at the
+  // slice's input — exactly the pattern we want to avoid.
+  if (auto slice = dyn_cast<tosa::SliceOp>(op)) {
+    SmallVector<Value, 2> vs{slice.getInput1(), slice.getResult()};
     Layout primary = pickPrimary(vs, ctx);
     if (primary.empty())
       return;
@@ -1796,7 +2212,22 @@ static bool isLayoutPermutableOp(Operation *op) {
              // conversion) are per-element; their result types can be
              // safely re-shaped via the same WHCN permutation as their
              // input.
-             tosa::RescaleOp, tosa::CastOp>(op);
+             tosa::RescaleOp, tosa::CastOp,
+             // Slice with WHCN-permuted start/size operands. The
+             // permutation of the start/size const values happens in
+             // the layout-to-whcn pass's Phase 2.5 (slice-specific
+             // operand permutation). Without making slice permutable
+             // here, the layout pass would insert NHWC↔WHCN boundary
+             // transposes around the slice — and that transpose-slice-
+             // transpose chain on u8 tensors stalls TIM-VX's runtime
+             // command queue under graph-execution pressure (10s NPU
+             // watchdog → vxProcessGraph returns failure with no log).
+             // Specifically observed on ResNet18 stages 2/3/4 where
+             // the projection-shortcut downsample's TOSA expression
+             // routes through `transpose → slice (1px crop) →
+             // transpose → 1x1 stride-2 conv`. Stage 1 has identity
+             // shortcuts so the chain doesn't appear.
+             tosa::SliceOp>(op);
 }
 
 // Pretty bridging inserter: insert a tosa.transpose just before `useOp`,
@@ -1861,6 +2292,65 @@ struct TosaLayoutToWhcnPass
     if (!failedConsts.empty()) {
       for (auto c : failedConsts)
         c.emitError("tosa-layout-to-whcn: cannot permute (non-FP32 / non-static)");
+      return signalPassFailure();
+    }
+
+    // Phase 2.5: permute tosa.slice's start/size const operands.
+    //
+    // tosa.slice has two operand-form 1-D index vectors (`start` /
+    // `size`) whose i-th entry indexes the i-th axis of the slice's
+    // input. When the input is being permuted from NHWC to WHCN, those
+    // operand vectors must be permuted by the SAME index permutation
+    // (i.e. WHCN_start[i] = NHWC_start[perm[i]] where perm is the
+    // WHCN-from-NHWC perm) — otherwise the slice would crop the wrong
+    // axes. The const_shape ops backing these operands are tiny 1-D
+    // index tensors and not "feature maps", so Phase 2's layout-tag-
+    // driven const permutation skips them.
+    //
+    // Without this phase the start/size would still address NHWC dims
+    // while the input is now in WHCN — output values would be garbage
+    // and the runtime composition would mis-route memory reads.
+    SmallVector<tosa::SliceOp> failedSlices;
+    mod.walk([&](tosa::SliceOp slice) {
+      auto it = layouts.find(slice.getResult());
+      if (it == layouts.end()) return;
+      auto perm = computeWhcnPerm(it->second);
+      if (perm.empty() || perm.size() <= 1) return;
+
+      auto permuteShapeOperand = [&](Value operand) -> bool {
+        auto cs = operand.getDefiningOp<tosa::ConstShapeOp>();
+        if (!cs) return false;
+        auto attr = dyn_cast<DenseIntElementsAttr>(cs.getValuesAttr());
+        if (!attr) return false;
+        if (attr.getNumElements() != static_cast<int64_t>(perm.size()))
+          return false;
+
+        // Reuse the original APInts (they carry their own bitwidth, so
+        // we don't need to ask the element type — it's `index`, which
+        // isn't IntOrFloat and rejects getIntOrFloatBitWidth()).
+        SmallVector<APInt> orig;
+        orig.reserve(attr.getNumElements());
+        for (APInt v : attr.getValues<APInt>())
+          orig.push_back(v);
+        SmallVector<APInt> permuted(perm.size());
+        for (size_t i = 0; i < perm.size(); ++i)
+          permuted[i] = orig[perm[i]];
+
+        auto newAttr = DenseIntElementsAttr::get(
+            cast<RankedTensorType>(attr.getType()), permuted);
+        cs.setValuesAttr(newAttr);
+        return true;
+      };
+
+      bool ok = permuteShapeOperand(slice.getStart()) &&
+                permuteShapeOperand(slice.getSize());
+      if (!ok) failedSlices.push_back(slice);
+    });
+    if (!failedSlices.empty()) {
+      for (auto s : failedSlices)
+        s.emitError("tosa-layout-to-whcn: slice start/size operands are "
+                    "not const_shape; layout-permutable slice requires "
+                    "compile-time-known indices");
       return signalPassFailure();
     }
 
@@ -2033,10 +2523,11 @@ struct TosaToTIMVXPass : public impl::TosaToTIMVXPassBase<TosaToTIMVXPass> {
         TensorOnlyOpConversion<tosa::SubOp, SubOp>,
         // Bespoke (attribute / operand translation).
         ClampOpConversion, MulOpConversion, MatMulOpConversion,
-        MaxPool2DConversion, ConstOpConversion, ConstShapeOpConversion,
-        Conv2DOpConversion, AvgPool2DConversion,
+        ConstOpConversion, ConstShapeOpConversion,
+        Conv2DOpConversion,
         ReduceSumConversion>(&getContext());
     patterns.add<RescaleConvFusion, CastConversion, PadConversion,
+                 MaxPool2DConversion, AvgPool2DConversion,
                  ReshapeOpConversion, SliceOpConversion,
                  TransposeConversion>(&getContext(), qmap);
 
@@ -2048,6 +2539,161 @@ struct TosaToTIMVXPass : public impl::TosaToTIMVXPassBase<TosaToTIMVXPass> {
 
 std::unique_ptr<Pass> createTosaToTIMVXPass() {
   return std::make_unique<TosaToTIMVXPass>();
+}
+
+//===----------------------------------------------------------------------===//
+// timvx-conv1x1-to-fc
+//===----------------------------------------------------------------------===//
+//
+// Pattern: when a `timvx.conv2d` has W=H=1 input, W=H=1 weight, and unit
+// pad/stride/dilation, it's mathematically a fully-connected layer. Routes
+// through `timvx.fully_connected` (which has a tighter NN-engine path on
+// Vivante NPUs — the weight is pre-tiled at bind vs. Conv2D's per-call
+// spatial setup). Triggered by tflite's quantized exporter, which emits
+// the trailing classifier as a 1x1 Conv2D + reshape pair.
+
+namespace {
+
+// Match a 1x1 timvx.conv2d and rewrite to reshape→fully_connected→reshape.
+struct Conv1x1ToFC : public OpRewritePattern<Conv2DOp> {
+  using OpRewritePattern<Conv2DOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(Conv2DOp op,
+                                 PatternRewriter &rewriter) const final {
+    auto inTy = dyn_cast<RankedTensorType>(op.getInput().getType());
+    auto wTy  = dyn_cast<RankedTensorType>(op.getWeight().getType());
+    auto outTy = dyn_cast<RankedTensorType>(op.getType());
+    if (!inTy || !wTy || !outTy) return failure();
+    if (inTy.getRank() != 4 || wTy.getRank() != 4 || outTy.getRank() != 4)
+      return failure();
+
+    // TIM-VX inner-first convention. Input: WHCN. Weight: WHIcOc. Output: WHCN.
+    auto inS = inTy.getShape();
+    auto wS  = wTy.getShape();
+    auto oS  = outTy.getShape();
+    if (inS[0] != 1 || inS[1] != 1) return failure();      // input W=H=1
+    if (wS[0]  != 1 || wS[1]  != 1) return failure();      // weight W=H=1
+    if (oS[0]  != 1 || oS[1]  != 1) return failure();      // output W=H=1
+    int64_t K = inS[2], batch = inS[3];
+    int64_t M = wS[3];
+    if (wS[2] != K || oS[2] != M || oS[3] != batch) return failure();
+
+    // Unit pad/stride/dilation only — anything else has no FC equivalent.
+    auto pad = op.getPad();
+    auto stride = op.getStride();
+    auto dilation = op.getDilation();
+    if (pad.size() != 4 || pad[0] != 0 || pad[1] != 0 ||
+        pad[2] != 0 || pad[3] != 0)
+      return failure();
+    if (stride.size() != 2 || stride[0] != 1 || stride[1] != 1)
+      return failure();
+    if (dilation.size() != 2 || dilation[0] != 1 || dilation[1] != 1)
+      return failure();
+
+    // Weight must be a `timvx.const` so we can re-attach the dense data
+    // to a rank-2 type (`reshape` is shape-only at the elements-attr level).
+    auto wConst = op.getWeight().getDefiningOp<ConstOp>();
+    if (!wConst) return failure();
+    auto wAttr = dyn_cast<DenseElementsAttr>(wConst.getValuesAttr());
+    if (!wAttr) return failure();
+
+    Location loc = op.getLoc();
+    Type elemTy = wTy.getElementType();
+
+    // [1,1,K,M] → [K,M] — same memory order, just dropping the size-1
+    // outer dims.
+    auto newWTy = RankedTensorType::get({K, M}, elemTy);
+    auto newWAttr = wAttr.reshape(newWTy);
+    Value newWeight = ConstOp::create(rewriter, loc, newWTy, newWAttr,
+                                       wConst.getQuantScaleAttr(),
+                                       wConst.getQuantZpAttr());
+
+    // Helper: build a `timvx.reshape` carrying explicit `output_scale`/
+    // `output_zp` attrs so fmtTensorSpec can emit a fully-quantized spec
+    // for the new transient. Without these the emitted runtime tensor
+    // would land as a plain INT8 (no Quantization()), creating a
+    // dtype-vs-quant mismatch with the surrounding u8 ops once the
+    // i8|asym→u8 promotion fires.
+    auto reshapeWithQuant = [&](Value src, ArrayRef<int64_t> newShape,
+                                 FloatAttr s, IntegerAttr z) -> Value {
+      auto srcTy = cast<RankedTensorType>(src.getType());
+      auto shapeTy = RankedTensorType::get(
+          {static_cast<int64_t>(newShape.size())}, rewriter.getIndexType());
+      SmallVector<APInt> shapeInts;
+      shapeInts.reserve(newShape.size());
+      for (int64_t d : newShape)
+        shapeInts.emplace_back(/*numBits=*/64,
+                                /*val=*/static_cast<uint64_t>(d),
+                                /*isSigned=*/true);
+      auto shapeAttr = DenseIntElementsAttr::get(shapeTy, shapeInts);
+      Value shapeConst = ConstShapeOp::create(rewriter, loc, shapeTy,
+                                                shapeAttr);
+      auto outRTy = RankedTensorType::get(newShape, srcTy.getElementType());
+      return ReshapeOp::create(rewriter, loc, outRTy, src, shapeConst, s, z);
+    };
+
+    // Recover the input's (scale, zp) from its defining op's
+    // `output_scale` / `output_zp` attrs (every quantized timvx op
+    // carries them in this convention). If the input traces back to
+    // something without them (e.g. a func arg, or a non-quant op),
+    // fall through with null attrs — the emitted spec then has no
+    // Quantization() and TIM-VX's auto-rewriter takes over.
+    FloatAttr inScale;
+    IntegerAttr inZp;
+    if (auto *defOp = op.getInput().getDefiningOp()) {
+      inScale = defOp->getAttrOfType<FloatAttr>("output_scale");
+      inZp = defOp->getAttrOfType<IntegerAttr>("output_zp");
+    }
+
+    // Reshape input [1,1,K,batch] -> [batch,K]. The runtime helper for
+    // FC (timvx_runtime::fully_connected) reads `out_features = output
+    // shape.back()` and constructs the op with `axis=1` — i.e. it
+    // expects the MLIR FC contract "input is rank-2 [batch, K], output
+    // is [batch, N]". Match that convention here so the same helper
+    // works for both the matmul→FC fast path and our Conv1x1ToFC.
+    Value xR = reshapeWithQuant(op.getInput(), {batch, K}, inScale, inZp);
+
+    // FC: [batch,K] x [K,M] + [M] -> [batch,M]. Output quant matches
+    // the conv's (rescale-derived) output.
+    auto fcOutTy = RankedTensorType::get({batch, M}, outTy.getElementType());
+    Value fc = FullyConnectedOp::create(rewriter, loc, fcOutTy, xR, newWeight,
+                                         op.getBias(),
+                                         op.getOutputScaleAttr(),
+                                         op.getOutputZpAttr());
+
+    // Reshape FC result back to [1,1,M,batch] so downstream consumers
+    // see the same type as the original Conv2D output. Quant matches FC's.
+    Value restored = reshapeWithQuant(fc, oS, op.getOutputScaleAttr(),
+                                       op.getOutputZpAttr());
+    rewriter.replaceOp(op, restored);
+    return success();
+  }
+};
+
+struct TIMVXConv1x1ToFCPass
+    : public impl::TIMVXConv1x1ToFCPassBase<TIMVXConv1x1ToFCPass> {
+  void runOnOperation() final {
+    RewritePatternSet patterns(&getContext());
+    patterns.add<Conv1x1ToFC>(&getContext());
+    // The greedy driver folds + CSE-merges ConstantLike ops by default.
+    // For `timvx.const`, fold() returns the `values` attr only — the
+    // default materializer then rebuilds `timvx.const` without the
+    // optional `quant_scale` / `quant_zp` attrs, stripping every
+    // weight/bias const's quant info and breaking downstream codegen.
+    // Disable folding and constant-CSE for this pass: we don't need
+    // them (Conv1x1ToFC matches op shapes, not values).
+    GreedyRewriteConfig cfg;
+    cfg.enableFolding(false);
+    cfg.enableConstantCSE(false);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns), cfg)))
+      signalPassFailure();
+  }
+};
+
+} // namespace
+
+std::unique_ptr<Pass> createTIMVXConv1x1ToFCPass() {
+  return std::make_unique<TIMVXConv1x1ToFCPass>();
 }
 
 //===----------------------------------------------------------------------===//
@@ -2087,6 +2733,42 @@ emitc::OpaqueType shapeOpaqueTy(MLIRContext *c) {
 }
 emitc::OpaqueType graphOpaqueTy(MLIRContext *c) {
   return emitc::OpaqueType::get(c, kGraphCxx);
+}
+
+// Decide whether an asymmetric int8 tensor should be emitted as u8 with
+// zp shifted +128. On VIP9000Nano-DI the runtime's
+// `_add_graph_dataconvert_for_int8` (vsi_nn_graph_optimization.c) auto-
+// promotes every asym int8 IO tensor to u8|asym(zp+128) and inserts a
+// DataConvert at the boundary; that auto-DataConvert COMPILE_FAILs at
+// graph IO for non-trivial shapes (the `vivante.nn.tensorcopy` kernel
+// rejects e.g. rank-2 1×1000 outputs, even though same-shape `u8↔i8`
+// passes the per-pair probe). Pre-emitting all asym int8 specs as u8
+// matches the form TIM-VX wants internally — internally consistent
+// throughout, so the auto-rewriter sees no candidates and skips
+// inserting the boundary DataConvert. Constants need their bytes
+// XOR'd with 0x80 to compensate for the storage relabel.
+//
+// Cases we promote:
+//   - Plain `i8` element type with explicit asym scale/zp on the
+//     producing op (our convention: `output_scale`/`output_zp` on the
+//     `timvx.*` op, or `quant_scale`/`quant_zp` on `timvx.const`).
+//   - `quant.uniform<i8:f32, S:Z>` element type with signed i8 storage
+//     (TOSA-encoded asym int8 — surfaces on tosa.const after import).
+//
+// Cases we leave alone:
+//   - `i8` without asym quant (raw int8, no zp transform applies).
+//   - `u8` (already u8).
+//   - Per-channel int8 (the chip rejects per-channel weights anyway;
+//     we don't have a clean per-channel→per-tensor remap here).
+static bool shouldPromoteI8AsymToU8(Type elem, FloatAttr scaleOverride,
+                                     IntegerAttr zpOverride) {
+  if (auto i = dyn_cast<IntegerType>(elem))
+    if (i.getWidth() == 8 && i.isSignless())
+      return scaleOverride && zpOverride;
+  if (auto quni = dyn_cast<quant::UniformQuantizedType>(elem))
+    if (auto sty = dyn_cast<IntegerType>(quni.getStorageType()))
+      return sty.getWidth() == 8 && quni.isSigned();
+  return false;
 }
 
 // Render an MLIR element type as the matching tim::vx::DataType enum literal.
@@ -2192,7 +2874,16 @@ void writePodArray(llvm::raw_string_ostream &os, ArrayRef<T> values,
 // Render an ElementsAttr — inline `dense<...>` or `dense_resource<...>` —
 // as `static const T name[N] = { v0, v1, ... };`. Returns "" if the storage
 // or element type isn't one we handle.
-std::string fmtStaticArrayDecl(ElementsAttr values, StringRef name) {
+//
+// When `promoteI8ToU8` is true (caller's choice — driven by
+// `shouldPromoteI8AsymToU8`), the array is emitted as `uint8_t[]` with
+// each byte XOR'd 0x80, so reading the bytes as u8 with zp shifted +128
+// gives the same real values as reading the original bytes as i8 with
+// the original zp. The values must be backed by a signless i8 storage
+// (inline `DenseElementsAttr` or `DenseI8ResourceElementsAttr`) — other
+// storage shapes return "".
+std::string fmtStaticArrayDecl(ElementsAttr values, StringRef name,
+                                bool promoteI8ToU8 = false) {
   auto rt = cast<RankedTensorType>(values.getType());
   Type elem = rt.getElementType();
   // Rank-0 (scalar) tensors hold one value; the C++ array still needs a
@@ -2201,6 +2892,32 @@ std::string fmtStaticArrayDecl(ElementsAttr values, StringRef name) {
 
   std::string out;
   llvm::raw_string_ostream os(out);
+
+  if (promoteI8ToU8) {
+    os << "static const uint8_t " << name << "[" << numel << "] = {";
+    bool first = true;
+    auto emit = [&](uint8_t b) {
+      os << (first ? "" : ", ") << static_cast<int>(b);
+      first = false;
+    };
+    if (auto ints = values.tryGetValues<APInt>()) {
+      for (APInt v : *ints) {
+        // i8 byte → equivalent u8 byte (x XOR 0x80). The 8-bit truncation
+        // is implicit in the cast-to-uint8 below.
+        emit(static_cast<uint8_t>(v.getZExtValue()) ^ 0x80);
+      }
+    } else if (auto r = dyn_cast<DenseI8ResourceElementsAttr>(values)) {
+      auto data = r.tryGetAsArrayRef();
+      if (!data) return "";
+      for (int8_t v : *data)
+        emit(static_cast<uint8_t>(v) ^ 0x80);
+    } else {
+      return "";
+    }
+    os << "};";
+    return out;
+  }
+
   os << "static const " << cxxScalarType(elem) << " " << name << "[" << numel
      << "] = {";
 
@@ -2309,6 +3026,26 @@ std::string fmtTensorSpec(Type ty, StringRef tensorAttr = "TRANSIENT",
   Type elem = rt.getElementType();
   std::string s;
   llvm::raw_string_ostream os(s);
+
+  if (shouldPromoteI8AsymToU8(elem, scaleOverride, zpOverride)) {
+    double scale;
+    int64_t zp;
+    if (scaleOverride && zpOverride) {
+      scale = scaleOverride.getValueAsDouble();
+      zp = zpOverride.getInt();
+    } else {
+      auto quni = cast<quant::UniformQuantizedType>(elem);
+      scale = quni.getScale();
+      zp = quni.getZeroPoint();
+    }
+    os << "tim::vx::TensorSpec(tim::vx::DataType::UINT8, " << kShapeCxx
+       << fmtBraceList(rt.getShape())
+       << ", tim::vx::TensorAttribute::" << tensorAttr
+       << ", tim::vx::Quantization(tim::vx::QuantType::ASYMMETRIC, "
+       << fmtFloatLiteral(scale) << ", " << (zp + 128) << "))";
+    return os.str();
+  }
+
   os << "tim::vx::TensorSpec(" << tvxDataType(elem) << ", "
      << kShapeCxx << fmtBraceList(rt.getShape())
      << ", tim::vx::TensorAttribute::" << tensorAttr;
@@ -2455,8 +3192,15 @@ struct ConstToEmitC : public OpConversionPattern<ConstOp> {
                   ConversionPatternRewriter &rewriter) const final {
     auto values = cast<ElementsAttr>(op.getValuesAttr());
 
+    // i8|asym consts get bit-flipped (XOR 0x80) and emitted as uint8_t,
+    // matching the u8|asym(zp+128) spec the matching fmtTensorSpec path
+    // emits. See shouldPromoteI8AsymToU8 for the rationale.
+    bool promote = shouldPromoteI8AsymToU8(
+        cast<RankedTensorType>(op.getType()).getElementType(),
+        op.getQuantScaleAttr(), op.getQuantZpAttr());
+
     std::string name = "_timvx_const_" + std::to_string((*counter)++);
-    std::string decl = fmtStaticArrayDecl(values, name);
+    std::string decl = fmtStaticArrayDecl(values, name, promote);
     if (decl.empty())
       return rewriter.notifyMatchFailure(
           op, "unsupported element type / storage for constant data");
@@ -2657,10 +3401,10 @@ struct FullyConnectedToEmitC : public OpConversionPattern<FullyConnectedOp> {
   }
 };
 
-struct DataConvertToEmitC : public OpConversionPattern<DataConvertOp> {
+struct CastToEmitC : public OpConversionPattern<CastOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
-  matchAndRewrite(DataConvertOp op, OpAdaptor adaptor,
+  matchAndRewrite(CastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
     MLIRContext *c = rewriter.getContext();
     SmallVector<Attribute, 1> trailing{
@@ -2668,7 +3412,7 @@ struct DataConvertToEmitC : public OpConversionPattern<DataConvertOp> {
                               op.getOutputScaleAttr(),
                               op.getOutputZpAttr())),
     };
-    return emitRuntimeCall(rewriter, op, "dataconvert",
+    return emitRuntimeCall(rewriter, op, "cast",
                            ValueRange{adaptor.getInput()}, trailing,
                            tensorOpaqueTy(c));
   }
@@ -2766,7 +3510,7 @@ struct TIMVXToEmitCPass
     patterns.add<ConstToEmitC>(converter, ctx, &constCounter);
 
     patterns.add<ConstShapeToEmitC, ClipToEmitC, Conv2DToEmitC,
-                 Pool2DToEmitC, TransposeToEmitC, DataConvertToEmitC,
+                 Pool2DToEmitC, TransposeToEmitC, CastToEmitC,
                  PadToEmitC, FullyConnectedToEmitC, ReduceSumToEmitC,
                  ReshapeToEmitC, SliceToEmitC>(converter, ctx);
 

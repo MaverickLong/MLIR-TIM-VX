@@ -23,6 +23,9 @@ Required env (each overridable):
   VIV_SDK_LIB_DIR  — Verisilicon driver SDK lib/ (OpenVX / OpenVXU live here);
                      defaults to EXTERNAL_VIV_SDK/lib if EXTERNAL_VIV_SDK is set.
   CXX              — host C++ compiler      (default: clang++-16, then clang++)
+  CXXFLAGS         — host C++ flags         (default: "-O0 -pipe"; set to
+                     "-O2 -g" etc. for an optimized debug build — runner is a
+                     thin tim::vx::Graph harness so -O0 is the right default)
 """
 
 import argparse
@@ -106,20 +109,26 @@ def resolve_paths(args) -> dict:
 
 def lower(p: dict, input_path: Path) -> None:
     print(f"[1/6] tosa-const-fold + tosa-layout-tag + tosa-layout-to-whcn + "
-          f"canonicalize + tosa-to-timvx -> {p['timvx_mlir']}")
+          f"canonicalize + tosa-to-timvx + timvx-conv1x1-to-fc "
+          f"-> {p['timvx_mlir']}")
     # `--verify-each=false`: TOSA's spatial-op verifiers expect NHWC shape
     # relationships; once `--tosa-layout-to-whcn` permutes to WHCN those
     # checks fail, but `--tosa-to-timvx` immediately consumes them.
     # `--canonicalize` after WHCN folds the boundary transpose against the
     # front-end's NCHW->NHWC transpose into one combined permute.
-    run([p["mlir_opt"],
-         "--verify-each=false",
-         "--tosa-const-fold",      # collapse BatchNorm scalar chains first
-         "--tosa-layout-tag",      # annotate per-axis layouts on the surviving ops
-         "--tosa-layout-to-whcn",  # permute tagged tensors NHWC/OHWI -> WHCN
-         "--canonicalize",         # fold composed transposes at boundaries
-         "--tosa-to-timvx",
-         input_path, "-o", p["timvx_mlir"]])
+    # `--timvx-conv1x1-to-fc` runs after the lowering: collapses tflite's
+    # final-classifier 1x1 conv2d into a real FullyConnected (better NN-
+    # engine path than Conv2D on Vivante).
+    cmd = [p["mlir_opt"], "--verify-each=false",
+           "--tosa-const-fold"]
+    if not p.get("skip_avgpool_fold"):
+        cmd.append("--tosa-fold-avgpool-reduce")
+    cmd += ["--tosa-layout-tag", "--tosa-layout-to-whcn",
+            "--canonicalize", "--tosa-to-timvx"]
+    if not p.get("skip_conv1x1_fc"):
+        cmd.append("--timvx-conv1x1-to-fc")
+    cmd += [input_path, "-o", p["timvx_mlir"]]
+    run(cmd)
 
     print(f"[2/6] timvx-to-emitc         -> {p['emitc_mlir']}")
     run([p["mlir_opt"], "--timvx-to-emitc", p["timvx_mlir"], "-o", p["emitc_mlir"]])
@@ -191,14 +200,27 @@ def parse_input_specs(timvx_mlir_path: Path) -> list[dict]:
         if dtype_tag not in DTYPE_TO_VX:
             sys.exit(f"unsupported tensor element type '{dtype_tag}' "
                      f"in arg {len(specs)} of {timvx_mlir_path}")
+
+        # Promote asym int8 inputs to u8 with zp+128 — mirrors the
+        # `shouldPromoteI8AsymToU8` rule applied to every spec on the
+        # EmitC side. The runner's input tensor must match the
+        # tim::vx::TensorSpec the lowered C++ uses for its first user
+        # op, otherwise the runtime auto-DataConvert kicks in (and
+        # COMPILE_FAILs at IO on this chip). For the byte data the user
+        # feeds in, the runner-side conversion is the same bit-flip
+        # (XOR 0x80) the `print_output` path applies in reverse.
+        runner_dtype = DTYPE_TO_VX[dtype_tag]
+        runner_scale = (quant_scale if dtype_tag in ("i8", "ui8") else 0.0)
+        runner_zp    = (quant_zp    if dtype_tag in ("i8", "ui8") else 0)
+        if dtype_tag == "i8" and quant_scale != 0.0:
+            runner_dtype = "UINT8"
+            runner_zp    = quant_zp + 128
+
         specs.append({
             "dims": dims,
-            "dtype": DTYPE_TO_VX[dtype_tag],
-            # Apply the same (scale, zp) to every input arg. Single-input
-            # models (the common case) match cleanly; multi-input quant
-            # models would need per-arg recovery — extend here when needed.
-            "quant_scale": quant_scale if dtype_tag in ("i8", "ui8") else 0.0,
-            "quant_zp":    quant_zp if dtype_tag in ("i8", "ui8") else 0,
+            "dtype": runner_dtype,
+            "quant_scale": runner_scale,
+            "quant_zp": runner_zp,
         })
     return specs
 
@@ -257,6 +279,12 @@ def pick_cxx() -> str:
     return cxx
 
 
+def _spawn(cmd):
+    """Like run() but non-blocking — caller waits on the returned Popen."""
+    print("  $ " + " ".join(str(c) for c in cmd))
+    return subprocess.Popen([str(c) for c in cmd])
+
+
 def build(p: dict) -> None:
     tim_vx_build_dir = Path(os.environ.get(
         "TIM_VX_BUILD_DIR", p["tim_vx_dir"] / "build"))
@@ -290,16 +318,46 @@ def build(p: dict) -> None:
         sys.exit(f"expected CustomGemm sample at {custom_gemm_cc}")
 
     cxx = pick_cxx()
-    print(f"[6/6] {cxx} -> {p['exec_bin']}")
-    run([
-        cxx, "-std=c++17", "-O2", "-fPIC",
+
+    # The runner is a thin harness around tim::vx::Graph; the perf-critical
+    # work runs on the NPU inside libtim-vx.so. The included <base>.func.cpp
+    # is the whole model body as one giant TU and dominates wall time at
+    # -O2, so default to -O0 for fast iteration. Override via CXXFLAGS env
+    # (e.g. CXXFLAGS="-O2 -g") when you actually want an optimized binary.
+    cxxflags = os.environ.get("CXXFLAGS", "-O0 -pipe").split()
+
+    # lld links noticeably faster than bfd on this workload; fall back
+    # silently if it isn't installed.
+    link_extra = ["-fuse-ld=lld"] if shutil.which("ld.lld") else []
+
+    compile_flags = [
+        "-std=c++17", "-fPIC", *cxxflags,
         f"-I{p['tim_vx_dir']}/include",
         f"-I{p['script_dir']}",          # timvx_runtime.h
         f"-I{custom_gemm_dir}",          # custom_gemm.h
+    ]
+
+    runner_obj = p["out_dir"] / "runner_main.o"
+    custom_obj = p["out_dir"] / "custom_gemm.o"
+
+    # Compile both TUs in parallel — runner_main.cpp (with its #included
+    # whole-model func.cpp) is by far the heavier one, but custom_gemm.cc
+    # still costs a few seconds and there's no reason to serialize them.
+    print(f"[6/6] {cxx} (parallel compile + link) -> {p['exec_bin']}")
+    procs = [
+        _spawn([cxx, *compile_flags, "-c", p["runner_cpp"], "-o", runner_obj]),
+        _spawn([cxx, *compile_flags, "-c", custom_gemm_cc, "-o", custom_obj]),
+    ]
+    rcs = [pr.wait() for pr in procs]
+    if any(rcs):
+        sys.exit(f"compile failed (runner_main.o={rcs[0]}, "
+                 f"custom_gemm.o={rcs[1]})")
+
+    run([
+        cxx, *cxxflags, *link_extra,
+        runner_obj, custom_obj,
         f"-L{timvx_lib_dir}",
         f"-L{viv_sdk_lib_dir}",
-        p["runner_cpp"],
-        custom_gemm_cc,
         "-ltim-vx", "-lOpenVX", "-lOpenVXU",
         "-Wl,--unresolved-symbols=ignore-in-shared-libs",
         f"-Wl,-rpath,{timvx_lib_dir}",
@@ -322,9 +380,22 @@ def main() -> None:
                          "(default: debug_scripts/lower_out/<basename>)")
     ap.add_argument("--skip-build", action="store_true",
                     help="Stop after generating C++; skip clang link step")
+    # A/B-test flags: bypass individual recent passes when bisecting a
+    # runtime regression. Both are off by default (i.e. the passes run).
+    ap.add_argument("--no-avgpool-fold", action="store_true",
+                    help="Skip --tosa-fold-avgpool-reduce. Compile peak RSS "
+                         "will jump back up (~5GiB) but avg-pool runs as "
+                         "the slice+add chain. Use to isolate avg-pool-fold "
+                         "regressions.")
+    ap.add_argument("--no-conv1x1-fc", action="store_true",
+                    help="Skip --timvx-conv1x1-to-fc. The trailing 1x1 conv2d "
+                         "stays as conv2d instead of becoming fully_connected. "
+                         "Use to isolate FC regressions.")
     args = ap.parse_args()
 
     p = resolve_paths(args)
+    p["skip_avgpool_fold"] = args.no_avgpool_fold
+    p["skip_conv1x1_fc"] = args.no_conv1x1_fc
 
     lower(p, args.input)
     stage4(p)

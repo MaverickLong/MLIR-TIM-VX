@@ -388,12 +388,40 @@ def TIMVX_DataConvertOp : TIMVX_FuncTypeOp<"dataconvert", [
         Pure,
         SameOperandsAndResultShape
     ]> {
-  let summary = "Change tensor dtype, optionally requantizing.";
+  let summary = "Requantize between two int dtypes (or same-dtype rescale).";
   let description = [{
-    Lowers to tim::vx::ops::DataConvert. With matching quant params on the
-    input and output specs, this acts as a requantize; otherwise it is a
-    pure dtype convert. Used to lower `tosa.cast` and the int8 quantize /
-    dequantize boundaries that quantized TOSA emits explicitly.
+    Lowers to tim::vx::ops::DataConvert. The runtime applies the
+    (input scale,zp) → (output scale,zp) projection in storage space, so
+    DataConvert is the right tool for int↔int requantize and for the
+    int→f32 dequantize boundary. It is NOT the right tool for f32→int —
+    that direction COMPILE_FAILs on VIP9000Nano-DI on this chip even
+    though `vsi_nn_op_dataconvert.c`'s op_check table claims it is
+    accepted; use `timvx.cast` for any f32 boundary.
+  }];
+
+  let arguments = (ins
+      TIMVX_Tensor:$input,
+      OptionalAttr<F64Attr>:$output_scale,
+      OptionalAttr<I64Attr>:$output_zp
+  );
+  let results = (outs TIMVX_Tensor:$output);
+}
+
+def TIMVX_CastOp : TIMVX_FuncTypeOp<"cast", [
+        Pure,
+        SameOperandsAndResultShape
+    ]> {
+  let summary = "Value-cast between dtypes; ignores any input/output scale/zp.";
+  let description = [{
+    Lowers to tim::vx::ops::Cast. The op runs the GPU `cast` kernel
+    (via vsi_nn_kernel_selector) which performs a real-value-preserving
+    cast: it does NOT apply the input or output (scale, zp) — those are
+    metadata for downstream ops. Use this to lower `tosa.cast` for any
+    pair where fp32 is on either side (`f32↔{u8|asym, i8|asym, i32 raw}`)
+    and for `i32_raw → {u8|asym, i8|asym}` rescale-tail conversions.
+    Any optional output (scale, zp) is attached to the output tensor's
+    spec so consumers see the right metadata, but does not affect the
+    cast's numeric behavior.
   }];
 
   let arguments = (ins

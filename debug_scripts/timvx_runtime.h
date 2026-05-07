@@ -35,7 +35,7 @@
 #include "tim/vx/ops/pool2d.h"
 #include "tim/vx/ops/reduce.h"           // ReduceSum
 #include "tim/vx/ops/reshape.h"
-#include "tim/vx/ops/simple_operations.h" // Rcp, DataConvert
+#include "tim/vx/ops/simple_operations.h" // Rcp, Cast
 #include "tim/vx/ops/slice.h"
 #include "tim/vx/ops/transpose.h"
 
@@ -225,15 +225,15 @@ inline TensorPtr reduce_sum(GraphPtr graph, TensorPtr input,
   return out;
 }
 
-// DataConvert: dtype change with scale/zp ignored — i.e., the integer
-// values are reinterpreted in the new dtype. Used to lower `tosa.cast`
-// (e.g., i8 → f32 dequantize cast or f32 → i32 → i8 quantize cast); the
-// surrounding tosa.sub / tosa.mul ops do the actual dequantization with
-// explicit scale/zp constants in fp32.
-inline TensorPtr dataconvert(GraphPtr graph, TensorPtr input,
-                              tim::vx::TensorSpec output_spec) {
+// Cast: value-preserving dtype convert. Routes through the GPU `cast`
+// kernel (tim::vx::ops::Cast) which is what every `tosa.cast` lowers
+// to — covers f32 ↔ {i8|asym, u8|asym, i32 raw} on this chip. The
+// output tensor's quant metadata (scale,zp on output_spec) is honored
+// by downstream ops but not by the cast itself.
+inline TensorPtr cast(GraphPtr graph, TensorPtr input,
+                      tim::vx::TensorSpec output_spec) {
   auto out = graph->CreateTensor(output_spec);
-  auto op = graph->CreateOperation<tim::vx::ops::DataConvert>();
+  auto op = graph->CreateOperation<tim::vx::ops::Cast>();
   (*op).BindInput(input).BindOutput(out);
   return out;
 }

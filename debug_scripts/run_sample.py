@@ -108,6 +108,27 @@ def main() -> int:
     if not viv_sdk_lib_dir.is_dir():
         sys.exit(f"VIV_SDK_LIB_DIR does not exist: {viv_sdk_lib_dir}")
 
+    # libCLC's JIT EVIS / CL shader compiler resolves
+    # `#include "cl_viv_vx_ext.h"` against `$VIVANTE_SDK_DIR/include/CL/`.
+    # The runtime unified-tina SDK doesn't ship that header, but TIM-VX's
+    # prebuilt-sdk does — bundle it into a shim dir we point
+    # VIVANTE_SDK_DIR at when launching the runner. Anything that lowers
+    # a `tosa.cast` (now via tim::vx::ops::Cast) hits this path —
+    # without the shim the kernel JIT fails with "Cannot find the header
+    # file cl_viv_vx_ext.h". Idempotent.
+    viv_shim = script_dir / ".build" / "viv_sdk_shim"
+    viv_prebuilt_header = (repo_root / "TIM-VX" / "prebuilt-sdk" /
+                           "x86_64_linux" / "include" / "CL" /
+                           "cl_viv_vx_ext.h")
+    target_header = viv_shim / "include" / "CL" / "cl_viv_vx_ext.h"
+    if not target_header.is_file():
+        if not viv_prebuilt_header.is_file():
+            sys.exit(f"prebuilt-sdk header missing: {viv_prebuilt_header}\n"
+                     f"  the EVIS shader compiler needs cl_viv_vx_ext.h "
+                     f"to JIT cast/elementwise kernels.")
+        target_header.parent.mkdir(parents=True, exist_ok=True)
+        target_header.write_bytes(viv_prebuilt_header.read_bytes())
+
     # Decode → temp file. tempfile.mkstemp returns (fd, path); close fd so
     # numpy.tofile can open the path itself.
     fd, raw = tempfile.mkstemp(prefix="timvx-input-", suffix=".bin", dir="/tmp")
@@ -128,15 +149,38 @@ def main() -> int:
             str(viv_sdk_lib_dir),
             os.environ.get("LD_LIBRARY_PATH", ""),
         ]))
-        env = {**os.environ, "LD_LIBRARY_PATH": ld_path}
+        env = {**os.environ,
+               "LD_LIBRARY_PATH": ld_path,
+               "VIVANTE_SDK_DIR": str(viv_shim),
+               "VSI_NN_LOG_LEVEL": str(5)}
 
         print("---", file=sys.stderr)
         print(f"running {args.runner} {input_bin}", file=sys.stderr)
         print(f"  LD_LIBRARY_PATH += {timvx_lib_dir}:{viv_sdk_lib_dir}",
               file=sys.stderr)
+        print(f"  VIVANTE_SDK_DIR  = {viv_shim}", file=sys.stderr)
         print("---", file=sys.stderr)
 
+        import time
+        t0 = time.monotonic()
         result = subprocess.run([str(args.runner), str(input_bin)], env=env)
+        elapsed = time.monotonic() - t0
+        # Surface exit code + signal info so a silent crash (typical
+        # libGAL / OVXLIB abort path: SIGSEGV inside the kernel JIT, or
+        # an internal exit() call) doesn't look like a clean termination.
+        # A negative returncode in subprocess.run means the process was
+        # killed by signal -returncode (e.g. -11 = SIGSEGV).
+        if result.returncode < 0:
+            import signal
+            try:
+                sig_name = signal.Signals(-result.returncode).name
+            except (ValueError, AttributeError):
+                sig_name = f"signal {-result.returncode}"
+            print(f"[run_sample] runner killed by {sig_name} after "
+                  f"{elapsed:.2f}s", file=sys.stderr)
+        else:
+            print(f"[run_sample] runner exited rc={result.returncode} "
+                  f"after {elapsed:.2f}s", file=sys.stderr)
         return result.returncode
     finally:
         if not args.keep:

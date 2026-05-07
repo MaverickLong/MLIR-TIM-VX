@@ -119,6 +119,67 @@ def TosaConstFoldPass : Pass<"tosa-const-fold", "::mlir::ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// tosa-fold-avgpool-reduce
+//===----------------------------------------------------------------------===//
+
+def TosaFoldAvgPoolReducePass
+    : Pass<"tosa-fold-avgpool-reduce", "::mlir::ModuleOp"> {
+  let summary = "Fold global avg-pool emitted as `reduce_sum × 2 → mul(1/N)`"
+                " into `avg_pool2d` operating on the requantized u8 tensor.";
+
+  let description = [{
+    tflite's TOSA exporter emits global average pooling as a chain of two
+    `tosa.reduce_sum` ops (one over H, one over W) followed by a
+    `tosa.reshape` that drops the spatial size-1 dims and a `tosa.mul` by
+    `1/(H*W)`. After that comes the trailing requantize chain
+    (`mul scale → add zp → cast f32 → narrow int`) that
+    `RequantI32SkipFold` collapses upstream.
+
+    The decomposed `tosa.reduce_sum` lowers via `ReduceSumConversion` to
+    `kernel_extent` `tosa.slice` + `kernel_extent − 1` `tosa.add` ops in
+    fp32 — each `slice` with a unique `(start, size)` signature compiles
+    a dedicated EVIS shader on this chip. For a 7×7 reduce that's 14
+    shaders; libCLC's per-shader compile heap doesn't release between
+    invocations, and a ResNet18 compile peak balloons to ~5 GiB — large
+    enough that the kernel OOM-killer trips it.
+
+    This pass recognizes the avg-pool chain at the TOSA level, walks
+    back from the trailing requant cast through the reduce_sum chain,
+    and replaces it with a single `tosa.avg_pool2d` operating on the
+    u8 tensor. The trick that makes this sound:
+
+      original: `cast(scale * (sum(x)/N) + zp)` over fp32 sum
+      rewrite:  `avg_pool2d(cast(scale * x + zp))` over u8
+
+    These are mathematically equal — `cast` (saturate-round) commutes
+    with averaging up to half-an-LSB rounding noise. We push the
+    per-pixel requant up to before the spatial reduction so the avg
+    runs on u8 (a single Pool2D AVG kernel rather than 14 slice
+    shaders), and `avg_pool2d` divides by N internally so the explicit
+    `mul(1/N)` drops out.
+
+    Limitations:
+      * Only matches when the trailing cast carries the
+        `timvx.output_scale` / `timvx.output_zp` discardable attrs that
+        `RequantI32SkipFold` deposits — i.e. the requant tail must
+        already be in canonical post-fold form. (Run order:
+        `tosa-const-fold` → this pass → `tosa-to-timvx`.)
+      * Reduce axes must be H (axis 1 in NHWC) and W (axis 2). Other
+        axis combinations are left alone.
+      * If any op between the spatial fp32 input and the requant cast
+        has multiple uses (other than the consumer in the chain), the
+        rewrite bails — pulling the cast forward would change semantics
+        for the other consumer.
+  }];
+
+  let constructor = "::mlir::timvx::createTosaFoldAvgPoolReducePass()";
+
+  let dependentDialects = [
+      "::mlir::tosa::TosaDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // tosa-to-timvx
 //===----------------------------------------------------------------------===//
 
@@ -136,6 +197,39 @@ def TosaToTIMVXPass : Pass<"tosa-to-timvx", "::mlir::ModuleOp"> {
   let dependentDialects = [
       "::mlir::timvx::TIMVXDialect",
       "::mlir::tosa::TosaDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// timvx-conv1x1-to-fc
+//===----------------------------------------------------------------------===//
+
+def TIMVXConv1x1ToFCPass : Pass<"timvx-conv1x1-to-fc", "::mlir::ModuleOp"> {
+  let summary = "Rewrite 1x1 timvx.conv2d with W=H=1 input/weight as fully_connected.";
+
+  let description = [{
+    Pattern: a `timvx.conv2d %x_4d, %w_4d, %b` whose input/weight/output
+    have W=1, H=1 (TIM-VX inner-first WHCN/WHIcOc) and unit pad/stride/
+    dilation collapses to a fully-connected layer over `K = Ic`,
+    `M = Oc`, batch = N. tflite's quantized exporter routes the trailing
+    classifier into this 1x1 conv shape; FullyConnected has a tighter
+    NN-engine path on Vivante NPUs (the weight is pre-tiled at
+    bind time vs. Conv2D's per-call spatial setup).
+
+    Rewrites to:
+      reshape `%x_4d : 1x1xKxN` → `KxN`
+      reshape weight const `1x1xKxM` → `KxM`        (compile-time, dense data unchanged)
+      timvx.fully_connected -> `MxN`
+      reshape `MxN` → `1x1xMxN`
+
+    Bias and `output_scale` / `output_zp` carry over unchanged. Runs
+    after `--tosa-to-timvx`; the rewrite itself is dialect-internal.
+  }];
+
+  let constructor = "::mlir::timvx::createTIMVXConv1x1ToFCPass()";
+
+  let dependentDialects = [
+      "::mlir::timvx::TIMVXDialect"
   ];
 }
 
