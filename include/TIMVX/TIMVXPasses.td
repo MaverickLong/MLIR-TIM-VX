@@ -12,84 +12,6 @@
 include "mlir/Pass/PassBase.td"
 
 //===----------------------------------------------------------------------===//
-// tosa-layout-tag
-//===----------------------------------------------------------------------===//
-
-def TosaLayoutTagPass : Pass<"tosa-layout-tag", "::mlir::ModuleOp"> {
-  let summary = "Annotate per-axis tensor layouts (NHWC, OHWI, broadcast, ...).";
-
-  let description = [{
-    Forward dataflow analysis that anchors at TOSA's spatial ops — where the
-    spec contractually fixes operand layouts (conv2d input NHWC + weight OHWI;
-    pool2d input NHWC) — and propagates the layout assignment through layout-
-    passthrough ops (binary / unary elementwise, with broadcast handling).
-
-    Each tagged op result gets a `timvx.layout` StringAttr like `"N,H,W,C"` or
-    `"1,1,1,C"`. Tagged func args get the same attribute via `arg_attrs`.
-    Comma-separated axis roles (`N`, `H`, `W`, `C`, `D`, `Oc`, `Ic`, `1` for
-    broadcast).
-
-    Propagation halts at ops whose layout transfer function isn't defined here
-    — `tosa.matmul`, `tosa.fully_connected`, `tosa.reshape`, `tosa.transpose`
-    (per request, transposes are left to `--tosa-reduce-transposes`). Untagged
-    values are treated as the boundary by the downstream WHCN-canonicalize
-    pass.
-
-    Errors on conflict: a value tagged with two different layouts (i.e. used
-    as a weight by one consumer and a feature map by another) — diagnostic
-    points at the value with the existing and new layouts.
-  }];
-
-  let constructor = "::mlir::timvx::createTosaLayoutTagPass()";
-
-  let dependentDialects = [
-      "::mlir::tosa::TosaDialect",
-      "::mlir::func::FuncDialect"
-  ];
-}
-
-//===----------------------------------------------------------------------===//
-// tosa-layout-to-whcn
-//===----------------------------------------------------------------------===//
-
-def TosaLayoutToWhcnPass : Pass<"tosa-layout-to-whcn", "::mlir::ModuleOp"> {
-  let summary = "Permute layout-tagged TOSA tensors from NHWC/OHWI to WHCN.";
-
-  let description = [{
-    Consumes the `timvx.layout` attributes set by `--tosa-layout-tag` and
-    rewrites the IR so that every tagged tensor is in TIM-VX's native
-    innermost-first WHCN convention.
-
-    Concretely, for each tagged value:
-      * Tagged `tosa.const` → emit a new const with permuted dense data
-        and the WHCN-shaped tensor type. Compile-time only.
-      * Tagged op result (non-const) → update the result's tensor type
-        in place to the WHCN-permuted shape. The op semantics are
-        layout-agnostic (broadcast / pointwise) so this is sound; for
-        spatial ops (`tosa.conv2d` / `tosa.max_pool2d` / `tosa.avg_pool2d`),
-        the kernel / stride / pad / dilation arrays are also swapped from
-        TOSA's `[H, W]` / `[top, bot, left, right]` to WHCN's
-        `[W, H]` / `[left, right, top, bot]`.
-
-    At each tagged ↔ untagged boundary, a single `tosa.transpose` is
-    inserted to bridge the layouts (NCHW or NHWC ↔ WHCN). The entry-side
-    transpose typically composes with the front-end's NCHW→NHWC
-    transpose; `--canonicalize` then folds the consecutive pair into one.
-
-    After this pass, the IR carries no `timvx.layout` attribute
-    (intentionally stripped — the layout is now implicit in the shapes).
-    Designed to run immediately before `--tosa-to-timvx`.
-  }];
-
-  let constructor = "::mlir::timvx::createTosaLayoutToWhcnPass()";
-
-  let dependentDialects = [
-      "::mlir::tosa::TosaDialect",
-      "::mlir::func::FuncDialect"
-  ];
-}
-
-//===----------------------------------------------------------------------===//
 // tosa-const-fold
 //===----------------------------------------------------------------------===//
 
@@ -115,6 +37,70 @@ def TosaConstFoldPass : Pass<"tosa-const-fold", "::mlir::ModuleOp"> {
 
   let dependentDialects = [
       "::mlir::tosa::TosaDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// tosa-quant-anchor
+//===----------------------------------------------------------------------===//
+
+def TosaQuantAnchorPass : Pass<"tosa-quant-anchor", "::mlir::ModuleOp"> {
+  let summary = "Anchor (scale, zp) on every TOSA tensor type as "
+                "!quant.uniform<i8:f32, S:Z>.";
+
+  let description = [{
+    Single-pass entry point that materialises absolute per-tensor
+    quantization context as `!quant.uniform<i8:f32, S:Z>` element types
+    on every quantized SSA value in the function. After this pass runs,
+    downstream lowerings (`tosa-to-timvx`, `RescaleConvFusion`,
+    `QuantResidualFuse`) read (S, Z) directly off the operand types
+    instead of re-deriving them.
+
+    Why a separate pass:
+
+    The IREE TFLite frontend strips the `!quant.uniform<...>` element
+    types its TFLite source carried — TOSA `RescaleOp` only encodes the
+    scale ratio `M = (Si × Sw) / So` as an integer multiplier+shift,
+    not absolute Si / Sw / So. Some tensors recover absolute Si from
+    the dequant-chain `mul` constants TFLite emits between residual
+    blocks (12 anchor sites in resnet18); the rest need the canonical
+    `Sw = 1/128` symmetric-int8 weight convention to back-compute So
+    through the rescale chain. Applying that convention scattered
+    across `buildQuantInfoMap` / `getProducerQuant` / `RescaleConvFusion`
+    made it invisible: a model that genuinely needs a different Sw
+    silently mislowered. Centralising the convention here makes it
+    observable in the IR (every quantized tensor's type carries the
+    derived (S, Z)) and emits a remark for each tensor whose Si came
+    from the convention path rather than from a real anchor.
+
+    Sources of (S, Z), in priority:
+      1. `timvx.output_scale`/`timvx.output_zp` arg-attr on a func arg.
+      2. `timvx.output_scale`/`timvx.output_zp` res-attr on a func result.
+      3. Dequant chain `cast(i8→f32) → sub(zp_const) → mul(scale_const)`
+         immediately downstream of a tensor — `mul`'s scalar f32 const
+         is the TFLite-published Si for that tensor.
+      4. `tosa.rescale`'s `output_zp` operand and the chain-or-arg-derived
+         Si: So = Si × Sw / M (Sw = 1/128 convention).
+      5. Pool / pad / transpose / reshape / slice propagate quant from
+         operand 0 to result.
+
+    Pass output:
+      - Every quantized i8 SSA value's tensor element type becomes
+        `!quant.uniform<i8:f32, S:Z>`.
+      - The function signature and `func.return` operand types are
+        updated to match.
+      - `tosa.const` ops with quantized result types keep their
+        `dense<...>` storage values verbatim (storage type still i8).
+
+    Run order: tosa-const-fold → tosa-fold-avgpool-reduce →
+               canonicalize → **tosa-quant-anchor** → tosa-to-timvx → ...
+  }];
+
+  let constructor = "::mlir::timvx::createTosaQuantAnchorPass()";
+
+  let dependentDialects = [
+      "::mlir::tosa::TosaDialect",
+      "::mlir::quant::QuantDialect"
   ];
 }
 
@@ -227,6 +213,63 @@ def TIMVXConv1x1ToFCPass : Pass<"timvx-conv1x1-to-fc", "::mlir::ModuleOp"> {
   }];
 
   let constructor = "::mlir::timvx::createTIMVXConv1x1ToFCPass()";
+
+  let dependentDialects = [
+      "::mlir::timvx::TIMVXDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// timvx-quant-residual-fuse
+//===----------------------------------------------------------------------===//
+
+def TIMVXQuantResidualFusePass
+    : Pass<"timvx-quant-residual-fuse", "::mlir::ModuleOp"> {
+  let summary = "Collapse the fp32 dequant+add+requant chain back to a "
+                "quantized timvx.add, eliminating the per-residual fp32 "
+                "detour every bottleneck block carries.";
+
+  let description = [{
+    The TOSA quantized rescale lowering produces a chain of fp32 ops
+    around every residual add in tflite-style models. For two i8
+    operands `A` (scale Sa, zp Za) and `B` (scale Sb, zp Zb) summed
+    into an i8 result with (Sout, Zout), the lowered chain looks like:
+
+        Af = cast i8 → f32 (A)
+        An = sub  (Af, Za)
+        Ar = mul  (An, Sa)            // operand A in real-value space
+        Bf = cast i8 → f32 (B)
+        Bn = sub  (Bf, Zb)
+        Br = mul  (Bn, Sb)            // operand B in real-value space
+        S  = add  (Ar, Br)            // residual add (still f32)
+        [optional clip(S, 0, +inf)]   // post-add ReLU
+        Si = mul  (clip?(S), 1/Sout)
+        Sz = add  (Si, Zout)
+        OUT = cast f32 → i8 (Sz)      // produces (Sout, Zout)
+
+    On VIP9000Nano-DI every fp32 op runs on the GC GPU's CL/EVIS
+    kernels at full spatial size — for ResNet50's 16 residuals this
+    dominates inference latency (~7× over a fully INT8 path). The
+    NN-core's quantized `Add` is a much faster path on the same chip
+    (probe matrix: u8↔u8↔u8 with mixed-quant operands PASSes; see
+    project_a733_fp32_conv_unsupported.md).
+
+    Rewrites the whole chain to:
+
+        OUT = timvx.add A B {output_scale = Sout, output_zp = Zout}
+        [optional timvx.clip OUT ...]    // preserves ReLU semantics
+
+    Constant-value cross-checks: each per-operand `mul scale_const`
+    must match the producer's `output_scale`, each `sub zp_const` must
+    match the producer's `output_zp`, the tail `mul (1/Sout)` must
+    invert `Sout`, and the tail `add Zout` must match the cast's
+    `output_zp`. Mismatches fall through (the chain isn't a pure
+    rescale chain).
+
+    Runs after `--tosa-to-timvx`; idempotent.
+  }];
+
+  let constructor = "::mlir::timvx::createTIMVXQuantResidualFusePass()";
 
   let dependentDialects = [
       "::mlir::timvx::TIMVXDialect"

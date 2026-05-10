@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -73,6 +74,79 @@ std::vector<uint8_t> read_file(const char* path) {
   return buf;
 }
 
+// Element size in bytes for each TIM-VX dtype the runner cares about.
+inline size_t bytesPerElem(tim::vx::DataType dt) {
+  switch (dt) {
+    case tim::vx::DataType::FLOAT16:
+    case tim::vx::DataType::INT16:
+    case tim::vx::DataType::UINT16: return 2;
+    case tim::vx::DataType::INT8:
+    case tim::vx::DataType::UINT8:
+    case tim::vx::DataType::BOOL8:  return 1;
+    case tim::vx::DataType::INT64:  return 8;
+    default:                         return 4;  // FLOAT32 / INT32 / UINT32
+  }
+}
+
+// Layout-convert bytes between MLIR row-major (rightmost dim is in-memory
+// innermost) and TIM-VX innermost-first (leftmost dim of the shape vector
+// is in-memory innermost), preserving the (i_0, ..., i_{R-1}) coord-to-
+// value mapping. The two byte layouts differ for any shape with two or
+// more non-trivial dims that aren't symmetrically arranged.
+//
+// Why this exists: the harness reads input.bin written by a Python
+// preprocess that outputs MLIR row-major bytes (W rightmost = innermost in
+// memory for NCHW). TIM-VX's transpose / conv / pool ops walk bytes per
+// the innermost-first convention. Without this conversion the MLIR ops'
+// output bytes are scrambled relative to MLIR semantics for any model
+// with non-palindromic shapes (the C=3 issue we hit with simple_v1).
+//
+// Doing this AT THE HARNESS BOUNDARY means the entire MLIR pipeline can
+// stay innocent of the convention mismatch — internal bytes are
+// uniformly TIM-VX-innermost-first, op_tests stay correct, and only
+// runner_main.cpp.tpl knows about the layout flip.
+inline void layoutConvert(const uint8_t* src, uint8_t* dst,
+                           const std::vector<uint32_t>& shape,
+                           size_t elem_size, bool from_mlir_to_tvx) {
+  size_t rank = shape.size();
+  size_t numel = 1;
+  for (auto d : shape) numel *= d;
+  if (rank <= 1) {
+    std::memcpy(dst, src, numel * elem_size);
+    return;
+  }
+  // mlir_strides[k] = product(shape[k+1..rank))  — rightmost is fastest.
+  // tvx_strides[k]  = product(shape[0..k))       — leftmost is fastest.
+  std::vector<size_t> mlir_strides(rank), tvx_strides(rank);
+  mlir_strides[rank - 1] = 1;
+  for (int k = static_cast<int>(rank) - 2; k >= 0; --k)
+    mlir_strides[k] = mlir_strides[k + 1] * shape[k + 1];
+  tvx_strides[0] = 1;
+  for (size_t k = 1; k < rank; ++k)
+    tvx_strides[k] = tvx_strides[k - 1] * shape[k - 1];
+
+  std::vector<size_t> idx(rank, 0);
+  for (size_t e = 0; e < numel; ++e) {
+    size_t mlir_off = 0, tvx_off = 0;
+    for (size_t k = 0; k < rank; ++k) {
+      mlir_off += idx[k] * mlir_strides[k];
+      tvx_off  += idx[k] * tvx_strides[k];
+    }
+    if (from_mlir_to_tvx) {
+      std::memcpy(dst + tvx_off * elem_size,
+                  src + mlir_off * elem_size, elem_size);
+    } else {
+      std::memcpy(dst + mlir_off * elem_size,
+                  src + tvx_off * elem_size, elem_size);
+    }
+    // Iterate idx in MLIR row-major order (least-significant first).
+    for (int k = static_cast<int>(rank) - 1; k >= 0; --k) {
+      if (++idx[k] < shape[k]) break;
+      idx[k] = 0;
+    }
+  }
+}
+
 void print_output(const std::shared_ptr<tim::vx::Tensor>& t) {
   const auto& shape = t->GetShape();
   size_t numel = 1;
@@ -97,27 +171,29 @@ void print_output(const std::shared_ptr<tim::vx::Tensor>& t) {
     if (!quant.ZeroPoints().empty()) zp = quant.ZeroPoints()[0];
   }
 
+  // Read raw TIM-VX-innermost-first bytes, then convert back to MLIR
+  // row-major so the summary (argmax index, first-N values) lines up
+  // with what CPU's MLIR-row-major output produces.
+  size_t elem = bytesPerElem(dtype);
+  std::vector<uint8_t> tvx_bytes(numel * elem);
+  if (!t->CopyDataFromTensor(tvx_bytes.data())) {
+    std::fprintf(stderr, "CopyDataFromTensor failed\n"); std::exit(3);
+  }
+  std::vector<uint8_t> mlir_bytes(numel * elem);
+  layoutConvert(tvx_bytes.data(), mlir_bytes.data(), shape, elem,
+                /*from_mlir_to_tvx=*/false);
+
   std::vector<float> buf(numel);
-  auto dequant_into = [&](auto raw) {
+  if (dtype == tim::vx::DataType::FLOAT32) {
+    std::memcpy(buf.data(), mlir_bytes.data(), numel * sizeof(float));
+  } else if (dtype == tim::vx::DataType::INT8) {
+    auto* raw = reinterpret_cast<const int8_t*>(mlir_bytes.data());
     for (size_t i = 0; i < numel; ++i)
       buf[i] = (static_cast<float>(raw[i]) - static_cast<float>(zp)) * scale;
-  };
-  if (dtype == tim::vx::DataType::FLOAT32) {
-    if (!t->CopyDataFromTensor(buf.data())) {
-      std::fprintf(stderr, "CopyDataFromTensor failed\n"); std::exit(3);
-    }
-  } else if (dtype == tim::vx::DataType::INT8) {
-    std::vector<int8_t> raw(numel);
-    if (!t->CopyDataFromTensor(raw.data())) {
-      std::fprintf(stderr, "CopyDataFromTensor failed\n"); std::exit(3);
-    }
-    dequant_into(raw);
   } else if (dtype == tim::vx::DataType::UINT8) {
-    std::vector<uint8_t> raw(numel);
-    if (!t->CopyDataFromTensor(raw.data())) {
-      std::fprintf(stderr, "CopyDataFromTensor failed\n"); std::exit(3);
-    }
-    dequant_into(raw);
+    auto* raw = mlir_bytes.data();
+    for (size_t i = 0; i < numel; ++i)
+      buf[i] = (static_cast<float>(raw[i]) - static_cast<float>(zp)) * scale;
   } else {
     std::fprintf(stderr,
                  "print_output: unsupported dtype %d; raw bytes only.\n",
@@ -168,10 +244,18 @@ int main(int argc, char** argv) {
   auto graph = ctx->CreateGraph();
   if (!graph) { std::fprintf(stderr, "ctx->CreateGraph failed\n"); return 1; }
 
+  // Read input file bytes upfront, but DEFER CopyDataToTensor until AFTER
+  // graph->Compile(). The TIM-VX samples (e.g. lenet_asymu8.cc) establish
+  // this order: build graph → Compile() → CopyDataToTensor → Run(). Doing
+  // the copy before Compile leaves INPUT tensors with no live data after
+  // Compile reorganises the graph — the model then sees a constant
+  // (typically all-zero) input and produces input-independent output.
   std::vector<std::shared_ptr<tim::vx::Tensor>> inputs;
+  std::vector<std::vector<uint8_t>> input_blobs;
   inputs.reserve(kInputs.size());
+  input_blobs.reserve(kInputs.size());
   for (size_t i = 0; i < kInputs.size(); ++i) {
-    auto raw = read_file(argv[i + 1]);
+    input_blobs.push_back(read_file(argv[i + 1]));
     auto spec = (kInputs[i].quant_scale != 0.0)
         ? tim::vx::TensorSpec(
               kInputs[i].dtype, kInputs[i].shape,
@@ -181,15 +265,7 @@ int main(int argc, char** argv) {
                                      kInputs[i].quant_zp))
         : tim::vx::TensorSpec(kInputs[i].dtype, kInputs[i].shape,
                               tim::vx::TensorAttribute::INPUT);
-    auto t = graph->CreateTensor(spec);
-    if (!t->CopyDataToTensor(raw.data(),
-                             static_cast<uint32_t>(raw.size()))) {
-      std::fprintf(stderr,
-                   "CopyDataToTensor failed for input %zu (%zu bytes)\n",
-                   i, raw.size());
-      return 3;
-    }
-    inputs.push_back(t);
+    inputs.push_back(graph->CreateTensor(spec));
   }
 
   // Stage markers + timing. We flush after every print because libGAL
@@ -237,6 +313,25 @@ int main(int argc, char** argv) {
   }
   double compile_ms = ms_since(t_compile);
   stage("compile done", compile_ms);
+
+  // Now (post-Compile) wire input bytes into the input tensors. See the
+  // note above kInputs/blobs initialization for why this is deferred.
+  // We layout-convert MLIR row-major bytes from input.bin to the
+  // TIM-VX innermost-first layout that internal ops walk in.
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    size_t elem = bytesPerElem(kInputs[i].dtype);
+    std::vector<uint8_t> tvx_bytes(input_blobs[i].size());
+    layoutConvert(input_blobs[i].data(), tvx_bytes.data(),
+                  kInputs[i].shape, elem, /*from_mlir_to_tvx=*/true);
+    if (!inputs[i]->CopyDataToTensor(
+            tvx_bytes.data(),
+            static_cast<uint32_t>(tvx_bytes.size()))) {
+      std::fprintf(stderr,
+                   "CopyDataToTensor failed for input %zu (%zu bytes)\n",
+                   i, tvx_bytes.size());
+      return 3;
+    }
+  }
 
   std::printf("[stage] running inference\n"); std::fflush(stdout);
   auto t_run = Clock::now();

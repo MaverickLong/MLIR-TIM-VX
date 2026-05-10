@@ -24,6 +24,7 @@ Required env (each overridable):
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -69,6 +70,106 @@ def decode_jpeg_to_fp32(image_path: Path, out_path: Path,
     h, w = img.shape[:2]
     # (H, W, 3) C-contiguous fp32 — same byte layout the C++ helper produced.
     np.ascontiguousarray(img, dtype=np.float32).tofile(out_path)
+    return h, w
+
+
+# Regex patterns for parsing the rendered runner_main.cpp's `kInputs`
+# initializer. We use these to infer the input tensor's dtype, shape, and
+# (scale, zp) at run time so we can write the right preprocessing — e.g.
+# tflite-quantized rn50 wants raw uint8 NCHW bytes, not normalized fp32
+# NHWC.
+_KINPUTS_RE = re.compile(
+    r"const std::vector<InputSpec> kInputs\s*=\s*\{(.*?)\};", re.S)
+_INPUTSPEC_RE = re.compile(
+    r"\{\s*\{([^}]+)\}\s*,\s*tim::vx::DataType::(\w+)"
+    r"(?:\s*,\s*([+-]?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?))?"
+    r"(?:\s*,\s*(-?\d+))?\s*\}")
+
+
+def parse_kinputs(runner_cpp: Path) -> list[dict]:
+    """Inspect the rendered runner_main.cpp's `kInputs` initializer and
+    return a list of {shape, dtype, quant_scale, quant_zp} dicts — one
+    per tensor input the runner expects. Used to drive input-image
+    preprocessing (uint8 vs fp32, NCHW vs NHWC layout, etc.)."""
+    if not runner_cpp.is_file():
+        return []
+    text = runner_cpp.read_text()
+    block = _KINPUTS_RE.search(text)
+    if not block:
+        return []
+    specs = []
+    for m in _INPUTSPEC_RE.finditer(block.group(1)):
+        shape = [int(s.strip()) for s in m.group(1).split(",") if s.strip()]
+        specs.append({
+            "shape": shape,
+            "dtype": m.group(2),
+            "quant_scale": float(m.group(3)) if m.group(3) else 0.0,
+            "quant_zp": int(m.group(4)) if m.group(4) else 0,
+        })
+    return specs
+
+
+def decode_jpeg_for_spec(image_path: Path, out_path: Path,
+                         spec: dict, normalize: bool) -> tuple[int, int]:
+    """Decode `image_path` and write bytes matching `spec` (parsed from
+    the runner's kInputs). Picks the right dtype + layout per spec:
+
+      * Float dtypes (FLOAT32 / FLOAT16): fp32 NHWC bytes, optionally
+        ImageNet-normalised. Mirrors the original behaviour.
+      * Integer dtypes (UINT8 / INT8): raw image bytes in the layout the
+        runner declared. NCHW for `[N, C=3, H, W]`-shaped inputs (the
+        typical tflite quantized vision model), NHWC for `[N, H, W, C=3]`.
+        No normalisation — the model carries the (scale, zp) it was
+        calibrated for, so the runner's tensor reads raw bytes directly
+        and dequantises via Quantization() at the kernel layer.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError as e:
+        sys.exit(f"missing dependency for image decode: {e}\n"
+                 f"install with: pip install numpy pillow")
+
+    shape = spec["shape"]
+    dtype = spec["dtype"]
+    if len(shape) != 4:
+        sys.exit(f"unsupported input rank {len(shape)} for image decode "
+                 f"(spec shape={shape})")
+
+    # Detect NCHW vs NHWC by which non-N dim is 3 (the colour channel).
+    # Falls back to NHWC for ambiguous cases (e.g. shape (1, 1, 1, 3)).
+    if shape[1] == 3 and shape[2] != 3:
+        layout = "NCHW"
+        h, w = shape[2], shape[3]
+    else:
+        layout = "NHWC"
+        h, w = shape[1], shape[2]
+
+    img = Image.open(image_path).convert("RGB").resize((w, h))
+
+    if dtype in ("FLOAT32", "FLOAT16"):
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        if normalize:
+            mean = np.array(IMAGENET_MEAN, dtype=np.float32)
+            std  = np.array(IMAGENET_STD,  dtype=np.float32)
+            arr = (arr - mean) / std
+        if layout == "NCHW":
+            arr = arr.transpose(2, 0, 1)  # HWC -> CHW
+        np.ascontiguousarray(arr, dtype=np.float32).tofile(out_path)
+    else:
+        # Integer dtypes — feed raw image bytes; the runner's
+        # Quantization(scale, zp) handles the dequant at op time.
+        arr = np.asarray(img, dtype=np.uint8)
+        if layout == "NCHW":
+            arr = arr.transpose(2, 0, 1)
+        if dtype == "INT8":
+            # If the runner declared INT8, store as signed; the harness
+            # below is responsible for the i8↔u8 byte semantics. Most
+            # tflite quantized models with i8 storage in MLIR get
+            # i8→u8 promoted by lower_to_timvx.py and end up as UINT8
+            # here.
+            arr = (arr.astype(np.int16) - 128).astype(np.int8)
+        np.ascontiguousarray(arr).tofile(out_path)
     return h, w
 
 
@@ -136,10 +237,27 @@ def main() -> int:
     input_bin = Path(raw)
 
     try:
-        h, w = decode_jpeg_to_fp32(image, input_bin, normalize=not args.no_norm)
-        kind = "[0,1]" if args.no_norm else "imagenet-normalized"
-        print(f"wrote {h*w*3} fp32 ({h}x{w}x3 NHWC, batch=1, {kind}) -> {input_bin}",
-              file=sys.stderr)
+        # Inspect the runner's compiled-in kInputs to pick the right
+        # preprocessing for this model. The runner is built next to its
+        # rendered runner_main.cpp; if the cpp isn't present we fall back
+        # to the legacy fp32 NHWC path.
+        runner_cpp = args.runner.parent / "runner_main.cpp"
+        specs = parse_kinputs(runner_cpp)
+        if specs and len(specs) == 1:
+            spec = specs[0]
+            h, w = decode_jpeg_for_spec(image, input_bin, spec,
+                                          normalize=not args.no_norm)
+            print(f"wrote {input_bin.stat().st_size} bytes "
+                  f"(shape={spec['shape']}, dtype={spec['dtype']}, "
+                  f"quant_scale={spec['quant_scale']}, "
+                  f"quant_zp={spec['quant_zp']}) -> {input_bin}",
+                  file=sys.stderr)
+        else:
+            h, w = decode_jpeg_to_fp32(image, input_bin,
+                                        normalize=not args.no_norm)
+            kind = "[0,1]" if args.no_norm else "imagenet-normalized"
+            print(f"wrote {h*w*3} fp32 ({h}x{w}x3 NHWC, batch=1, {kind}) -> {input_bin}",
+                  file=sys.stderr)
 
         if args.keep:
             print(f"input bin (kept): {input_bin}", file=sys.stderr)

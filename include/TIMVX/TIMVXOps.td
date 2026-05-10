@@ -55,7 +55,16 @@ def TIMVX_PoolTypeAttr : I32EnumAttr<"PoolType",
 //   corresponding TensorSpec.
 
 def TIMVX_ConstOp : TIMVX_Op<"const", [
-        ConstantLike, Pure,
+        // Note: deliberately *not* `ConstantLike`. MLIR's canonicalizer
+        // would otherwise dedupe `timvx.const` ops by `values` alone —
+        // discardable attrs and the typed `quant_scale`/`quant_zp`
+        // fields aren't part of its uniquing key. So a quant-tagged
+        // const emitted by RescaleConvFusion would silently get
+        // CSE-merged against an unrelated quant-less const carrying the
+        // same `values` (e.g. a `dense<0>` bias vs. a `dense<0>`
+        // input_zp), and the conv would lose its quant info
+        // non-deterministically.
+        Pure,
         AllShapesMatch<["values", "output"]>,
         FirstAttrDerivedResultType
     ]> {
@@ -93,8 +102,12 @@ def TIMVX_ConstShapeOp : TIMVX_Op<"const_shape", [ConstantLike, Pure]> {
 
 def TIMVX_ClipOp : TIMVX_FuncTypeOp<"clip", [
         Pure,
-        SameOperandsAndResultShape,
-        SameOperandsAndResultElementType
+        SameOperandsAndResultShape
+        // No SameOperandsAndResultElementType: when the input/output
+        // are quant.uniform<i8:f32, S:Z>, the post-clip (S, Z) commonly
+        // differs from the input's (e.g. QuantResidualFuse stamps the
+        // requant tail's Sout on the clipped result). The runtime
+        // handles per-tensor scale_factor between input/output.
     ]> {
   let summary = "Elementwise clip(input, min_val, max_val).";
   let description = [{
@@ -264,13 +277,59 @@ def TIMVX_SubOp : TIMVX_FuncTypeOp<"sub", [
 }
 
 def TIMVX_AddOp : TIMVX_FuncTypeOp<"add", [
-        Pure,
-        SameOperandsAndResultElementType
+        Pure
+        // No SameOperandsAndResultElementType: a quantized residual add
+        // takes operands with their own (S_a, Z_a) and (S_b, Z_b), and
+        // produces a result with yet-another (S_out, Z_out). The runtime
+        // handles per-tensor rescaling internally — the trait's
+        // exact-element-type check would reject the common case.
     ]> {
   let summary = "Elementwise addition.";
   let description = [{
     Elementwise addition of input1 + input2 (broadcastable).
     Lowers to tim::vx::ops::Add.
+  }];
+
+  let arguments = (ins
+      TIMVX_Tensor:$input1,
+      TIMVX_Tensor:$input2
+  );
+  let results = (outs TIMVX_Tensor:$output);
+}
+
+def TIMVX_MaximumOp : TIMVX_FuncTypeOp<"maximum", [
+        Pure,
+        Commutative,
+        SameOperandsAndResultElementType
+    ]> {
+  let summary = "Elementwise max(input1, input2).";
+  let description = [{
+    Elementwise maximum of input1 and input2 (broadcastable).
+    Lowers to tim::vx::ops::Maximum.
+
+    Used by `ClampOpConversion` to decompose `tosa.clamp(x, lo, hi)`
+    into `min(max(x, lo), hi)`. The decomposition deliberately avoids
+    `tim::vx::ops::Clip`, whose kernel-selector pattern-matches certain
+    finite ranges (`(-1, 1)` -> `relu1`, etc.) to specialised kernels
+    that mis-behave on VIP9000Nano-DI.
+  }];
+
+  let arguments = (ins
+      TIMVX_Tensor:$input1,
+      TIMVX_Tensor:$input2
+  );
+  let results = (outs TIMVX_Tensor:$output);
+}
+
+def TIMVX_MinimumOp : TIMVX_FuncTypeOp<"minimum", [
+        Pure,
+        Commutative,
+        SameOperandsAndResultElementType
+    ]> {
+  let summary = "Elementwise min(input1, input2).";
+  let description = [{
+    Elementwise minimum of input1 and input2 (broadcastable).
+    Lowers to tim::vx::ops::Minimum. See `TIMVX_MaximumOp`.
   }];
 
   let arguments = (ins
@@ -362,6 +421,17 @@ def TIMVX_TransposeOp : TIMVX_FuncTypeOp<"transpose", [
       OptionalAttr<I64Attr>:$output_zp
   );
   let results = (outs TIMVX_Tensor:$output);
+
+  // Canonicalizers:
+  //   * `transpose(const)` -> `const` with permuted dense data. Required
+  //     for conv2d/pool2d weights: TIM-VX's NN-engine kernel selector
+  //     refuses to bind a CONSTANT weight tensor through a runtime
+  //     transpose, so the IREE-style wrapper would otherwise compile-fail
+  //     for any conv whose weight didn't get pre-permuted at compile time.
+  //   * `transpose(transpose)` -> single transpose (composed perms).
+  //     Coalesces the wrapping pairs introduced by the spatial-op
+  //     converters when adjacent ops both wrap.
+  let hasCanonicalizer = 1;
 }
 
 //===----------------------------------------------------------------------===//
