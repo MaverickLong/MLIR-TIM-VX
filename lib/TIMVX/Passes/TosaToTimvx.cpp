@@ -754,31 +754,14 @@ struct RescaleStandaloneConversion
 // the cast itself). DataConvert is NOT used here — on this chip the
 // `vivante.nn.tensorcopy` path COMPILE_FAILs for every f32->int direction.
 //
-// i8↔u8 promotion bridge: TIM-VX tensors representing logical i8 carry
-// uint8 storage with bytes = int8 + 128 (see shouldPromoteI8AsymToU8 in
-// TimvxToEmitC.cpp). tim::vx::ops::Cast does a raw value-cast — uint8_t
-// → float yields 0..255 — but TOSA's `cast(i8 → f32)` expects the int8
-// interpretation (-128..127), and `cast(f32 → i8)` expects the inverse.
-// We patch by sandwiching the cast with an f32 ±128 sub/add when the
-// promoted side is i8. The sub/add operates on the f32 side so it works
-// regardless of the cast direction without needing extra rescales.
+// The i8↔u8 promotion bridge that used to live in this pattern has moved
+// to `--timvx-promote-i8-to-u8`, which runs after `--tosa-to-timvx` and
+// inserts/folds the ±128 compensation around every f32↔u8 cast in one
+// pass. This conversion just lowers the cast as-is.
 struct CastConversion : public OpConversionPattern<tosa::CastOp> {
   CastConversion(MLIRContext *ctx, const QuantInfoMap &qm)
       : OpConversionPattern(ctx), quantInfo(qm) {}
   const QuantInfoMap &quantInfo;
-
-  // Mirrors `shouldPromoteI8AsymToU8` in TimvxToEmitC.cpp: a
-  // `quant.uniform<i8:f32, …>` element type triggers the i8→u8
-  // promotion when the spec is emitted. Plain signless i8 only
-  // promotes when a scale/zp override is present at the use site,
-  // which a `tosa.cast` doesn't carry — so we conservatively skip
-  // the bias compensation in that case.
-  static bool isPromotedI8(Type elem) {
-    if (auto qt = dyn_cast<quant::UniformQuantizedType>(elem))
-      if (auto sty = dyn_cast<IntegerType>(qt.getStorageType()))
-        return sty.getWidth() == 8 && qt.isSigned();
-    return false;
-  }
 
   LogicalResult
   matchAndRewrite(tosa::CastOp op, OpAdaptor adaptor,
@@ -789,64 +772,6 @@ struct CastConversion : public OpConversionPattern<tosa::CastOp> {
       scale = rewriter.getF64FloatAttr(qi->scale);
       zp = rewriter.getI64IntegerAttr(qi->zp);
     }
-
-    Location loc = op.getLoc();
-    Value src = adaptor.getInput();
-    auto inTy = cast<RankedTensorType>(src.getType());
-    auto outTy = cast<RankedTensorType>(op.getType());
-    Type inElem = inTy.getElementType();
-    Type outElem = outTy.getElementType();
-
-    bool inIsI8 = isPromotedI8(inElem);
-    bool outIsI8 = isPromotedI8(outElem);
-    bool inIsF32 = inElem.isF32();
-    bool outIsF32 = outElem.isF32();
-
-    // Helper: build a 1-element f32 splat const = `v`. Broadcast against
-    // the f32 tensor in the sub/add op.
-    auto f32Splat = [&](float v) {
-      auto sty = RankedTensorType::get({1}, rewriter.getF32Type());
-      auto attr = DenseElementsAttr::get(
-          sty, rewriter.getF32FloatAttr(v).getValue());
-      return ConstOp::create(rewriter, loc, sty, attr,
-                             /*quant_scale=*/FloatAttr{},
-                             /*quant_zp=*/IntegerAttr{});
-    };
-
-    if (inIsI8 && outIsF32) {
-      // cast(u8→f32) emits 0..255; subtract 128.0 to land on the
-      // expected int8 interpretation -128..127.
-      Value casted = CastOp::create(rewriter, loc, outTy, src, scale, zp);
-      rewriter.replaceOpWithNewOp<SubOp>(op, outTy, casted, f32Splat(128.0f));
-      return success();
-    }
-    if (inIsF32 && outIsI8) {
-      // f32→i8 with `timvx.output_scale`/`timvx.output_zp` attrs is a
-      // RequantI32SkipFold tail. Two downstream passes consume it:
-      //   * `QuantResidualFuse` subsumes the cast into a `timvx.add`
-      //     and the EmitC pass already bakes the +128 into the output
-      //     spec via `shouldPromoteI8AsymToU8` — no compensation here.
-      //   * `StripUnfusedTailQuant` keeps the cast naked and is
-      //     responsible for inserting the `add(128.0)` then.
-      // Inserting the `+128` here would inject a stray `add` between
-      // the chain's existing `add(zp)` and the cast, which QRF rejects
-      // (it pattern-matches the immediate-tail add against `Zout`).
-      bool isRequantTail =
-          op->hasAttr("timvx.output_scale") && op->hasAttr("timvx.output_zp");
-      if (isRequantTail) {
-        rewriter.replaceOpWithNewOp<CastOp>(op, op.getType(),
-                                             adaptor.getInput(), scale, zp);
-        return success();
-      }
-      // The TIM-VX output tensor is uint8 (zp+128). To make `(uint8_t)v`
-      // land on the right byte for the original int8 value, pre-add 128.0
-      // to the f32 input.
-      Value shifted =
-          AddOp::create(rewriter, loc, inTy, src, f32Splat(128.0f));
-      rewriter.replaceOpWithNewOp<CastOp>(op, outTy, shifted, scale, zp);
-      return success();
-    }
-
     rewriter.replaceOpWithNewOp<CastOp>(op, op.getType(),
                                          adaptor.getInput(), scale, zp);
     return success();

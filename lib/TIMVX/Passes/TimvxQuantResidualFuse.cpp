@@ -406,31 +406,17 @@ struct QuantResidualFuse : public OpRewritePattern<CastOp> {
 // `output_scale` again on the f32->u8 path — double-scaling, saturating
 // everything to u8 max. Strip the attrs so the cast becomes a plain
 // numerical convert that just rounds + saturates to int.
-// Catch-all for any `cast(f32 → narrow-int)` carrying RequantI32SkipFold's
-// output_scale/output_zp attrs that QuantResidualFuse didn't subsume.
-// Two situations land here:
-//   * Final-return tail of a non-residual quant chain (the original
-//     intent of this pattern).
-//   * Intermediate residual-block cast where the upstream chain isn't
-//     a fuseable residual pattern (e.g. `--timvx-quant-residual-fuse`
-//     turned off, or the chain shape doesn't match QRF's template).
-// Both need the same treatment: strip the discardable attrs (the spec
-// already carries the (S, Z) on the output type) and insert the
-// `+128` bridge so the value-cast lands on the right uint8 byte under
-// the i8→u8 promotion. QRF's higher benefit guarantees fuseable
-// residual chains still get fused before this pattern is tried.
+// Strip the discardable `output_scale`/`output_zp` attrs from any
+// `cast(f32 → narrow-int)` carrying RequantI32SkipFold's tail-tag that
+// `QuantResidualFuse` didn't subsume — i.e. the final-return cast of a
+// non-residual quant chain, or an intermediate cast whose upstream
+// shape isn't fuseable. The (S, Z) is already on the result type; the
+// discardable attrs are only needed by QRF's pattern match. By the time
+// we get here, `--timvx-promote-i8-to-u8` has already inserted the ±128
+// real-value bridge around every f32↔u8 cast, so this pattern is now a
+// pure attr-strip.
 struct StripUnfusedTailQuant : public OpRewritePattern<CastOp> {
   using OpRewritePattern<CastOp>::OpRewritePattern;
-
-  // Mirrors `shouldPromoteI8AsymToU8` in TimvxToEmitC.cpp: a
-  // `quant.uniform<i8:f32, …>` storage type triggers the i8→u8
-  // promotion when the spec is emitted (bytes = int8 + 128).
-  static bool isPromotedI8(Type elem) {
-    if (auto qt = dyn_cast<quant::UniformQuantizedType>(elem))
-      if (auto sty = dyn_cast<IntegerType>(qt.getStorageType()))
-        return sty.getWidth() == 8 && qt.isSigned();
-    return false;
-  }
 
   LogicalResult matchAndRewrite(CastOp op,
                                  PatternRewriter &rewriter) const final {
@@ -438,10 +424,6 @@ struct StripUnfusedTailQuant : public OpRewritePattern<CastOp> {
     auto dstTy = dyn_cast<RankedTensorType>(op.getType());
     if (!srcTy || !dstTy) return failure();
     if (!srcTy.getElementType().isF32()) return failure();
-    // Unwrap `quant.uniform<i8:f32, …>` to its storage element type —
-    // `tosa-quant-anchor` stamps quant casts with that wrapped type,
-    // so a plain `dyn_cast<IntegerType>` would silently mismatch and
-    // the rewrite would never fire.
     Type dstElem = dstTy.getElementType();
     if (auto qty = dyn_cast<quant::QuantizedType>(dstElem))
       dstElem = qty.getStorageType();
@@ -450,26 +432,7 @@ struct StripUnfusedTailQuant : public OpRewritePattern<CastOp> {
     if (!op.getOutputScaleAttr() && !op.getOutputZpAttr())
       return failure();
 
-    Location loc = op.getLoc();
-    Value src = op.getInput();
-
-    // i8↔u8 promotion bridge: the TIM-VX output tensor is uint8 with
-    // bytes = int8 + 128 (see fmtTensorSpec's +128 path). The chain
-    // emits f32 in the [-128, 127] int8 interpretation; pre-add 128.0
-    // so `(uint8_t)round(f32)` lands on the right byte. Skip when
-    // the destination isn't a promoted i8 (e.g. u8 storage with
-    // user-declared zp, or other narrow types).
-    if (isPromotedI8(dstTy.getElementType())) {
-      auto sty = RankedTensorType::get({1}, rewriter.getF32Type());
-      auto attr = DenseElementsAttr::get(
-          sty, rewriter.getF32FloatAttr(128.0f).getValue());
-      Value c128 = ConstOp::create(rewriter, loc, sty, attr,
-                                    /*quant_scale=*/FloatAttr{},
-                                    /*quant_zp=*/IntegerAttr{});
-      src = AddOp::create(rewriter, loc, srcTy, src, c128);
-    }
-
-    rewriter.replaceOpWithNewOp<CastOp>(op, op.getType(), src,
+    rewriter.replaceOpWithNewOp<CastOp>(op, op.getType(), op.getInput(),
                                          FloatAttr{}, IntegerAttr{});
     return success();
   }

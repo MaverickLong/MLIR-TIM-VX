@@ -7,6 +7,7 @@ add_mlir_dialect_library(MLIRTIMVX
         Passes/TosaFoldAvgPoolReduce.cpp
         Passes/TosaToTimvx.cpp
         Passes/TimvxConv1x1ToFC.cpp
+        Passes/TimvxPromoteI8ToU8.cpp
         Passes/TimvxQuantResidualFuse.cpp
         Passes/TimvxToEmitC.cpp
 

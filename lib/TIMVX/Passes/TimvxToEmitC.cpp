@@ -59,27 +59,12 @@ emitc::OpaqueType graphOpaqueTy(MLIRContext *c) {
   return emitc::OpaqueType::get(c, kGraphCxx);
 }
 
-// Decide whether an asymmetric int8 tensor should be emitted as u8 with
-// zp shifted +128. On VIP9000Nano-DI the runtime auto-promotes every
-// asym int8 IO tensor to u8|asym(zp+128) and inserts a DataConvert at
-// the boundary; that auto-DataConvert COMPILE_FAILs at graph IO for
-// non-trivial shapes (the `vivante.nn.tensorcopy` kernel rejects e.g.
-// rank-2 1×1000 outputs, even though same-shape `u8 <-> i8` passes the
-// per-pair probe). Pre-emitting all asym int8 specs as u8 matches the
-// form TIM-VX wants internally — internally consistent throughout, so
-// the auto-rewriter sees no candidates and skips inserting the boundary
-// DataConvert. Constants need their bytes XOR'd with 0x80 to compensate
-// for the storage relabel.
-bool shouldPromoteI8AsymToU8(Type elem, FloatAttr scaleOverride,
-                              IntegerAttr zpOverride) {
-  if (auto i = dyn_cast<IntegerType>(elem))
-    if (i.getWidth() == 8 && i.isSignless())
-      return scaleOverride && zpOverride;
-  if (auto quni = dyn_cast<quant::UniformQuantizedType>(elem))
-    if (auto sty = dyn_cast<IntegerType>(quni.getStorageType()))
-      return sty.getWidth() == 8 && quni.isSigned();
-  return false;
-}
+// Note: every i8↔u8 promotion concern is handled exclusively by
+// `--timvx-promote-i8-to-u8`, which runs immediately after
+// `--tosa-to-timvx`. By the time this file is reached, every quantized
+// tensor is already u8 (storage type, zp, byte values, and the ±128
+// compensation around f32↔u8 casts), so the EmitC pass just emits the
+// types verbatim — no promotion logic, no override branches.
 
 // Render an MLIR element type as the matching tim::vx::DataType enum literal.
 std::string tvxDataType(Type t) {
@@ -218,14 +203,11 @@ void writePodArray(llvm::raw_string_ostream &os, ArrayRef<T> values,
 }
 
 // Render an ElementsAttr as `static const T name[N] = { v0, v1, ... };`.
-// Returns "" if the storage or element type isn't one we handle.
-//
-// When `promoteI8ToU8` is true, the array is emitted as `uint8_t[]` with
-// each byte XOR'd 0x80, so reading the bytes as u8 with zp shifted +128
-// gives the same real values as reading the original bytes as i8 with
-// the original zp.
-std::string fmtStaticArrayDecl(ElementsAttr values, StringRef name,
-                                bool promoteI8ToU8 = false) {
+// Returns "" if the storage or element type isn't one we handle. The
+// `--timvx-promote-i8-to-u8` pass has already rewritten any i8 const to
+// its u8-byte-flipped equivalent, so this function never sees signed-i8
+// quantized constants.
+std::string fmtStaticArrayDecl(ElementsAttr values, StringRef name) {
   auto rt = cast<RankedTensorType>(values.getType());
   Type elem = rt.getElementType();
   ArrayRef<int64_t> shape = rt.getShape();
@@ -233,33 +215,6 @@ std::string fmtStaticArrayDecl(ElementsAttr values, StringRef name,
 
   std::string out;
   llvm::raw_string_ostream os(out);
-
-  if (promoteI8ToU8) {
-    // Gather as int8 (MLIR row-major), reorder to TIM-VX innermost-first,
-    // then XOR 0x80 to land on UINT8 semantics with zp+128.
-    SmallVector<int8_t> mlir_bytes;
-    mlir_bytes.reserve(numel);
-    if (auto ints = values.tryGetValues<APInt>()) {
-      for (APInt v : *ints)
-        mlir_bytes.push_back(static_cast<int8_t>(v.getZExtValue()));
-    } else if (auto r = dyn_cast<DenseI8ResourceElementsAttr>(values)) {
-      auto data = r.tryGetAsArrayRef();
-      if (!data) return std::string();
-      mlir_bytes.assign(data->begin(), data->end());
-    } else {
-      return std::string();
-    }
-    auto reordered = reorderMlirToTvx<int8_t>(mlir_bytes, shape);
-    os << "static const uint8_t " << name << "[" << numel << "] = {";
-    bool first = true;
-    for (int8_t v : reordered) {
-      os << (first ? "" : ", ")
-         << static_cast<int>(static_cast<uint8_t>(v) ^ 0x80);
-      first = false;
-    }
-    os << "};";
-    return out;
-  }
 
   os << "static const " << cxxScalarType(elem) << " " << name << "[" << numel
      << "] = {";
@@ -379,25 +334,6 @@ std::string fmtTensorSpec(Type ty, StringRef tensorAttr = "TRANSIENT",
   Type elem = rt.getElementType();
   std::string s;
   llvm::raw_string_ostream os(s);
-
-  if (shouldPromoteI8AsymToU8(elem, scaleOverride, zpOverride)) {
-    double scale;
-    int64_t zp;
-    if (scaleOverride && zpOverride) {
-      scale = scaleOverride.getValueAsDouble();
-      zp = zpOverride.getInt();
-    } else {
-      auto quni = cast<quant::UniformQuantizedType>(elem);
-      scale = quni.getScale();
-      zp = quni.getZeroPoint();
-    }
-    os << "tim::vx::TensorSpec(tim::vx::DataType::UINT8, " << kShapeCxx
-       << fmtBraceList(rt.getShape())
-       << ", tim::vx::TensorAttribute::" << tensorAttr
-       << ", tim::vx::Quantization(tim::vx::QuantType::ASYMMETRIC, "
-       << fmtFloatLiteral(scale) << ", " << (zp + 128) << "))";
-    return os.str();
-  }
 
   os << "tim::vx::TensorSpec(" << tvxDataType(elem) << ", "
      << kShapeCxx << fmtBraceList(rt.getShape())
@@ -537,15 +473,8 @@ struct ConstToEmitC : public OpConversionPattern<ConstOp> {
                   ConversionPatternRewriter &rewriter) const final {
     auto values = cast<ElementsAttr>(op.getValuesAttr());
 
-    // i8|asym consts get bit-flipped (XOR 0x80) and emitted as uint8_t,
-    // matching the u8|asym(zp+128) spec the matching fmtTensorSpec path
-    // emits. See shouldPromoteI8AsymToU8 for the rationale.
-    bool promote = shouldPromoteI8AsymToU8(
-        cast<RankedTensorType>(op.getType()).getElementType(),
-        op.getQuantScaleAttr(), op.getQuantZpAttr());
-
     std::string name = "_timvx_const_" + std::to_string((*counter)++);
-    std::string decl = fmtStaticArrayDecl(values, name, promote);
+    std::string decl = fmtStaticArrayDecl(values, name);
     if (decl.empty())
       return rewriter.notifyMatchFailure(
           op, "unsupported element type / storage for constant data");
