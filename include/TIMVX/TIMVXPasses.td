@@ -220,6 +220,62 @@ def TIMVXConv1x1ToFCPass : Pass<"timvx-conv1x1-to-fc", "::mlir::ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// timvx-promote-i8-to-u8
+//===----------------------------------------------------------------------===//
+
+def TIMVXPromoteI8ToU8Pass : Pass<"timvx-promote-i8-to-u8", "::mlir::ModuleOp"> {
+  let summary = "Single-pass conversion of every quantized i8 tensor in the "
+                "TIM-VX dialect to its u8 equivalent (zp += 128, bytes XOR 0x80).";
+
+  let description = [{
+    On VIP9000Nano-DI the runtime auto-promotes every asymmetric int8 IO
+    tensor to `u8|asym(zp+128)` and inserts a `DataConvert` at the
+    boundary; that auto-DataConvert COMPILE_FAILs at graph IO for
+    non-trivial shapes. Pre-emitting all asym int8 specs as u8 matches
+    the form TIM-VX wants internally — internally consistent throughout,
+    so the auto-rewriter sees no candidates and skips inserting the
+    boundary DataConvert.
+
+    Historically this promotion was sprinkled across `TimvxToEmitC`
+    (`shouldPromoteI8AsymToU8` / `fmtTensorSpec` / `ConstToEmitC`),
+    `TosaToTimvx::CastConversion`, and
+    `TimvxQuantResidualFuse::StripUnfusedTailQuant`, with each site
+    independently checking "is this an i8 that needs promotion" and
+    racing to inject the same `+128` compensation. That fragility is
+    what motivates this pass: do every promotion exactly once, in one
+    place, before any other timvx-stage pass runs. Downstream passes
+    then assume u8 throughout and don't need any promotion-aware logic.
+
+    The pass:
+      * Rewrites every `quant.uniform<i8:f32, S:Z>` element type to
+        `quant.uniform<u8:f32, S:Z+128>` on op results, op operands,
+        block arguments, and `func.func` signature inputs/outputs.
+      * Updates every op's `output_zp` discardable attr to `Z + 128`
+        when the op's result tensor was i8-quantized.
+      * For each `timvx.const` whose result type is now u8-quantized,
+        rewrites the dense storage attribute to UI8 with each byte
+        XOR'd by 0x80, and shifts the op's `quant_zp` by +128.
+      * For each `timvx.cast` that crosses the `f32 ↔ u8` boundary,
+        inserts the `±128.0` real-value compensation. Optimization:
+        when an adjacent `timvx.add` / `timvx.sub` already carries a
+        scalar f32 const (the typical TFLite dequant/requant chain),
+        the pass folds the +128 into that existing const instead of
+        adding a redundant op — preserves QRF's chain pattern match.
+
+    Run order: `tosa-to-timvx` → `--canonicalize` →
+               **`timvx-promote-i8-to-u8`** → `timvx-quant-residual-fuse`
+               → `timvx-conv1x1-to-fc` → `timvx-to-emitc`.
+  }];
+
+  let constructor = "::mlir::timvx::createTIMVXPromoteI8ToU8Pass()";
+
+  let dependentDialects = [
+      "::mlir::timvx::TIMVXDialect",
+      "::mlir::quant::QuantDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // timvx-quant-residual-fuse
 //===----------------------------------------------------------------------===//
 

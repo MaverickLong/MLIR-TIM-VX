@@ -23,6 +23,7 @@ std::unique_ptr<Pass> createTosaQuantAnchorPass();
 std::unique_ptr<Pass> createTosaFoldAvgPoolReducePass();
 std::unique_ptr<Pass> createTosaToTIMVXPass();
 std::unique_ptr<Pass> createTIMVXConv1x1ToFCPass();
+std::unique_ptr<Pass> createTIMVXPromoteI8ToU8Pass();
 std::unique_ptr<Pass> createTIMVXQuantResidualFusePass();
 std::unique_ptr<Pass> createTIMVXToEmitCPass();
 
