@@ -112,13 +112,25 @@ struct Conv1x1ToFC : public OpRewritePattern<Conv2DOp> {
       inZp = defOp->getAttrOfType<IntegerAttr>("output_zp");
     }
 
-    // Reshape input [1,1,K,batch] -> [batch,K]. The runtime helper for FC
-    // expects the MLIR FC contract "input is rank-2 [batch, K], output is
-    // [batch, N]". Match that convention here.
-    Value xR = reshapeWithQuant(op.getInput(), {batch, K}, inScale, inZp);
+    // Reshape input [1,1,K,batch] -> [K,batch].
+    //
+    // Why [K,batch] instead of the MLIR FC contract [batch,K]: TIM-VX's
+    // FC kernel (`vsi_nn_op_fullconnect2.c`) internally reshapes its
+    // input to `{K, batch}` (K innermost) and its output to `{M, batch}`
+    // (M innermost) before dispatching to `vxFullyConnectedLayer`. Our
+    // "TIM-VX shape mirrors MLIR shape" convention places dim 0 as
+    // innermost, so feeding the kernel input shape `{batch, K}` makes
+    // the kernel walk bytes in batch-fastest order — wrong for batch>1
+    // and producing a column-permuted output even at batch=1 because
+    // the weight's row-major MLIR-shape mirror also gets the wrong
+    // outer/inner roles. Match the kernel's convention explicitly:
+    // shape both input and output as `{K, batch}`/`{M, batch}` with
+    // the contraction dim at index 0, and use `axis=0` in the runtime
+    // FC call.
+    Value xR = reshapeWithQuant(op.getInput(), {K, batch}, inScale, inZp);
 
-    // FC: [batch,K] x [K,M] + [M] -> [batch,M].
-    auto fcOutTy = RankedTensorType::get({batch, M}, outTy.getElementType());
+    // FC: [K,batch] x [K,M] + [M] -> [M,batch].
+    auto fcOutTy = RankedTensorType::get({M, batch}, outTy.getElementType());
     Value fc = FullyConnectedOp::create(rewriter, loc, fcOutTy, xR, newWeight,
                                          op.getBias(),
                                          op.getOutputScaleAttr(),
@@ -135,15 +147,11 @@ struct Conv1x1ToFC : public OpRewritePattern<Conv2DOp> {
         : ReshapeOp();
     if (userReshape) {
       auto userOutTy = cast<RankedTensorType>(userReshape.getType());
-      if (userOutTy == fcOutTy) {
-        rewriter.replaceOp(userReshape, fc);
-      } else {
-        Value reshaped = reshapeWithQuant(
-            fc, userOutTy.getShape(),
-            userReshape.getOutputScaleAttr(),
-            userReshape.getOutputZpAttr());
-        rewriter.replaceOp(userReshape, reshaped);
-      }
+      Value reshaped = reshapeWithQuant(
+          fc, userOutTy.getShape(),
+          userReshape.getOutputScaleAttr(),
+          userReshape.getOutputZpAttr());
+      rewriter.replaceOp(userReshape, reshaped);
       rewriter.eraseOp(op);
       return success();
     }

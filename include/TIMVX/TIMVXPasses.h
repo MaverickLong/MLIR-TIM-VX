@@ -25,6 +25,8 @@ std::unique_ptr<Pass> createTosaToTIMVXPass();
 std::unique_ptr<Pass> createTIMVXConv1x1ToFCPass();
 std::unique_ptr<Pass> createTIMVXPromoteI8ToU8Pass();
 std::unique_ptr<Pass> createTIMVXQuantResidualFusePass();
+std::unique_ptr<Pass> createTIMVXDequantFusePass();
+std::unique_ptr<Pass> createTIMVXCanonicalizeTransposePass();
 std::unique_ptr<Pass> createTIMVXToEmitCPass();
 
 #define GEN_PASS_DECL

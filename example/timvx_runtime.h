@@ -23,9 +23,21 @@
 #pragma once
 
 #include <array>
+#include <cerrno>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "tim/vx/context.h"
 #include "tim/vx/graph.h"
@@ -56,11 +68,85 @@ namespace timvx_runtime {
 using TensorPtr = std::shared_ptr<tim::vx::Tensor>;
 using GraphPtr  = std::shared_ptr<tim::vx::Graph>;
 
-// const_tensor: backing data is supplied by the lowered `static const T[]`
-// arrays the timvx-to-emitc pass emits ahead of each call site. The arrays
-// are pre-baked in TIM-VX innermost-first byte order at lowering time
-// (see reorderMlirToTvx in TimvxToEmitC.cpp), so we bind them directly
-// without any runtime layout fixup.
+// mmap_const: resolve a `_timvx_const_<id>.bin` file to a pointer suitable
+// for `graph->CreateTensor(spec, data)`. Files contain raw bytes in TIM-VX
+// innermost-first order — exactly what the inline `static const T[]` form
+// holds — and are emitted next to the executable by the timvx-to-emitc
+// pass when its `extern-const-dir` option is set.
+//
+// Search order for the directory containing the .bin file:
+//   1. $TIMVX_CONSTS_DIR (env override; lets you relocate the bins).
+//   2. dirname(/proc/self/exe)  (default; matches lower_to_timvx.py's
+//      layout where the runner and the bins land in the same out_dir).
+//
+// Each call returns a pointer to a fresh PROT_READ MAP_PRIVATE mapping.
+// Mappings live for the lifetime of the process — `static const T*` at
+// the call site means we mmap once on first entry to the model function
+// and reuse the pointer thereafter; we never munmap.
+//
+// Aborts on any error (open / fstat / size mismatch / mmap). Constants
+// are part of the build artifact set; if they're missing or truncated
+// the runner cannot meaningfully proceed.
+namespace detail {
+
+inline std::string consts_dir() {
+  if (const char* env = std::getenv("TIMVX_CONSTS_DIR")) return env;
+  char buf[PATH_MAX];
+  ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n <= 0) return std::string(".");
+  buf[n] = '\0';
+  std::string p(buf);
+  size_t slash = p.find_last_of('/');
+  return slash == std::string::npos ? std::string(".") : p.substr(0, slash);
+}
+
+}  // namespace detail
+
+inline const void* mmap_const(const char* filename, std::size_t expected_bytes) {
+  std::string path = detail::consts_dir() + "/" + filename;
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    std::fprintf(stderr, "mmap_const: open(%s) failed: %s\n",
+                 path.c_str(), std::strerror(errno));
+    std::abort();
+  }
+  struct stat st;
+  if (::fstat(fd, &st) < 0) {
+    std::fprintf(stderr, "mmap_const: fstat(%s) failed: %s\n",
+                 path.c_str(), std::strerror(errno));
+    ::close(fd);
+    std::abort();
+  }
+  if (static_cast<std::size_t>(st.st_size) < expected_bytes) {
+    std::fprintf(stderr,
+                 "mmap_const: %s is %lld bytes, expected at least %zu\n",
+                 path.c_str(),
+                 static_cast<long long>(st.st_size),
+                 expected_bytes);
+    ::close(fd);
+    std::abort();
+  }
+#ifdef MAP_POPULATE
+  constexpr int kMapFlags = MAP_PRIVATE | MAP_POPULATE;
+#else
+  constexpr int kMapFlags = MAP_PRIVATE;
+#endif
+  void* p = ::mmap(nullptr, expected_bytes, PROT_READ, kMapFlags, fd, 0);
+  ::close(fd);
+  if (p == MAP_FAILED) {
+    std::fprintf(stderr, "mmap_const: mmap(%s) failed: %s\n",
+                 path.c_str(), std::strerror(errno));
+    std::abort();
+  }
+  return p;
+}
+
+// const_tensor: backing data is supplied by either an inline lowered
+// `static const T[]` array or an mmap'd `_timvx_const_<id>.bin` file
+// (see `mmap_const` above). Either way, the buffer is pre-baked in
+// TIM-VX innermost-first byte order at lowering time (see
+// reorderMlirToTvx in TimvxToEmitC.cpp), so we bind the pointer
+// directly without any runtime layout fixup.
 inline TensorPtr const_tensor(GraphPtr graph,
                               tim::vx::TensorSpec spec,
                               const void* data) {
@@ -113,14 +199,19 @@ inline TensorPtr pool2d(GraphPtr graph, TensorPtr input,
 inline TensorPtr fully_connected(GraphPtr graph,
                                  TensorPtr input, TensorPtr weight, TensorPtr bias,
                                  tim::vx::TensorSpec output_spec) {
-  // The matmul→FC rewrite emits an output type of `[Ba*M, N]` where N is
-  // the out_features count (trailing dim).
+  // Output spec is `{out_features, batch}` (inner-first); out_features
+  // sits at dim 0. axis=0 tells the kernel that input dim 0 is the
+  // contraction (K) axis — matches `vsi_nn_op_fullconnect2.c`'s
+  // internal reshape to `{K, batch}` / `{ofm, batch}`. See the
+  // `TIMVX_FullyConnectedOp` description for why feeding the
+  // `{batch, K}` form with `axis=1` silently column-permutes the
+  // output for any non-trivial weight matrix.
   uint32_t out_features = output_spec.shape_.empty()
                               ? 0u
-                              : static_cast<uint32_t>(output_spec.shape_.back());
+                              : static_cast<uint32_t>(output_spec.shape_.front());
   auto out = graph->CreateTensor(output_spec);
   auto op  = graph->CreateOperation<tim::vx::ops::FullyConnected>(
-      /*axis=*/1u, out_features);
+      /*axis=*/0u, out_features);
   (*op).BindInputs({input, weight, bias}).BindOutput(out);
   return out;
 }

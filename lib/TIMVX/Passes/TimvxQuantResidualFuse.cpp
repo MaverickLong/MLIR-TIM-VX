@@ -13,6 +13,51 @@
 // (probe-matrix u8 <-> u8 <-> u8 PASS) is dramatically cheaper than the
 // CL/EVIS path the f32 chain compiles to.
 //
+// COUPLING WITH tosa-quant-anchor — IMPORTANT
+// -------------------------------------------
+// QRF is correctness-safe only when every operand's `quant.uniform`
+// type stamp agrees with the dequant chain's mul const (the per-operand
+// scale const) and sub const (the per-operand zp const). The runtime
+// `timvx.add` reads its operand quant from the operand tensor's spec
+// (= the type stamp); the chain const is what the un-fused dequant
+// would multiply through. If they disagree, the fused add dequantizes
+// each operand with the type-stamped S while QRF's chain-replacement
+// math assumed the chain-const S — output is wrong by exactly the
+// ratio (chain_S / type_S).
+//
+// `tosa-quant-anchor`'s `Sw=1/128` symmetric-int8 convention path
+// stamps a CONVENTION scale on every conv2d output whose TFLite-real
+// scale isn't recoverable from the local IR (no in-IR dequant chain to
+// pin Si, no arg-attr to anchor against). The TFLite-real scale lives
+// in the per-operand mul const of the downstream residual chain, NOT
+// on the type. That's a stable mismatch on any TFLite resnet-style
+// model that mixes symmetric (`Z=-128`) and asymmetric (`Z!=±128`)
+// conv outputs.
+//
+// In the un-fused path this divergence is invisible because TIM-VX's
+// `cast` op IGNORES the type's (S, Z) — the chain math operates on
+// raw byte values with chain consts directly. Fusing the chain hands
+// the math back to the type-stamped (S, Z), exposing the divergence.
+//
+// `matchDequantChain` cross-checks chain-const-S vs type-stamp-S for
+// every operand and SOFT-fails (leaves the chain unfused) on
+// disagreement. That's a LOCAL guard — it prevents emitting a wrong
+// fused add for THIS chain. It does NOT catch the global cascade: if
+// an upstream conv was anchored to convention-S and a different
+// downstream chain WAS fuseable (its scales locally agreed), the
+// downstream-fused add still sees the upstream operand decoded
+// through the convention-S, not the TFLite-real S the network was
+// trained for.
+//
+// Until `tosa-quant-anchor` recovers TFLite-real S for every tensor
+// (no `Sw=1/128` fallback), QRF on a model with mixed
+// symmetric+asymmetric quant cannot be guaranteed end-to-end correct
+// even with the local cross-check. For now: the local cross-check
+// minimises damage on partial-mismatch models; for full correctness
+// on those models the user should pass `--no-fuse`. simple_v1 and
+// `add_residual_i8` op_tests are designed to keep type-S == chain-S
+// throughout, so QRF is byte-identical to no-fuse on those.
+//
 //===----------------------------------------------------------------------===//
 
 #include "Common.h"
@@ -87,46 +132,65 @@ Value matchDequantChain(Operation *contextOp, Value real,
   if (!isa<IntegerType>(srcElem)) return {};
   if (!dstTy.getElementType().isF32()) return {};
 
-  // Cross-check is enforced only when the producer is a BlockArg with
-  // explicit `timvx.output_scale`/`timvx.output_zp` arg-attrs — the
-  // sole place where (S, Z) was the test author's deliberate
-  // declaration rather than a derivation. For non-BlockArg producers
-  // (e.g. an upstream `timvx.conv2d` whose stamped `output_scale` came
-  // from `tosa-quant-anchor`'s Sw=1/128 convention path), the type
-  // stamp may legitimately differ from the chain const — convention vs.
-  // TFLite-real — and the chain const is the byte-level source of
-  // truth for the fuse's math. Trust the chain const directly.
+  // Cross-check the chain const against the cast input's RUNTIME quant
+  // — i.e. the (S, Z) the TIM-VX runtime will use to dequantize the
+  // operand inside the fused `timvx.add` we're about to emit.
+  //
+  // The runtime quant comes from one of two places, in priority:
+  //   1. For a BlockArg, the `timvx.output_scale`/`timvx.output_zp`
+  //      arg-attr (`getProducerQuant`).
+  //   2. For an op-defined value, the `quant.uniform<...>` element type
+  //      stamped by `tosa-quant-anchor` and propagated through
+  //      tosa-to-timvx (read here off `cast.getInput().getType()`).
+  //
+  // BOTH must match the chain const, because once we fuse the chain
+  // away the runtime add reads its operand quant from the operand
+  // tensor's spec (= the type stamp). If `tosa-quant-anchor` derived
+  // S from its Sw=1/128 convention path while TFLite published a
+  // different S in the chain (a 3.4× drift on the symmetric-Z=-128
+  // resnet18 conv outputs), trusting the chain const after fusing
+  // gives a runtime-time math mismatch — the fused add dequantizes
+  // operand B with the typed S, but our `outScale` here used the
+  // chain S. Soft-fail and leave the chain unfused so the explicit
+  // mul-by-chain-const continues to do the right math at runtime.
+  auto checkQuant = [&](double prodS, int64_t prodZ,
+                         const char *prodSrc) -> bool {
+    if (!approxEq(prodS, *scaleConstF)) {
+      // Soft-fail: the chain isn't a faithful dequant of this operand.
+      // Don't strict-fail; the model is internally consistent, just
+      // not fuseable.
+      return false;
+    }
+    if (!approxEq(static_cast<double>(prodZ),
+                  static_cast<double>(*zpConstF))) {
+      return false;
+    }
+    (void)prodSrc;
+    return true;
+  };
+
   if (isa<BlockArgument>(cast.getInput())) {
     if (auto prod = getProducerQuant(cast.getInput())) {
-      if (!approxEq(prod->first, *scaleConstF)) {
-        contextOp->emitError()
-            << "QuantResidualFuse: dequant chain scale ("
-            << *scaleConstF
-            << ") disagrees with producer arg-attr scale ("
-            << prod->first
-            << ") — the IR is internally inconsistent";
-        *strictFailed = true;
+      if (!checkQuant(prod->first, prod->second, "BlockArg arg-attr"))
         return {};
-      }
-      if (!approxEq(static_cast<double>(prod->second),
-                    static_cast<double>(*zpConstF))) {
-        contextOp->emitError()
-            << "QuantResidualFuse: dequant chain zp ("
-            << *zpConstF
-            << ") disagrees with producer arg-attr zp ("
-            << prod->second
-            << ") — the IR is internally inconsistent";
-        *strictFailed = true;
-        return {};
+    }
+  } else {
+    // Op-defined producer. Read (S, Z) off the cast's input type's
+    // quant.uniform stamp (storage=int, expressed=f32).
+    auto castInTy = dyn_cast<RankedTensorType>(cast.getInput().getType());
+    if (castInTy) {
+      if (auto qt = dyn_cast<quant::UniformQuantizedType>(
+              castInTy.getElementType())) {
+        if (!checkQuant(qt.getScale(), qt.getZeroPoint(), "type stamp"))
+          return {};
       }
     }
   }
 
-  // Use the chain's reconstructed values as the source of truth — for
-  // BlockArg+arg-attr producers we just verified these agree; for
-  // op producers this is the TFLite-published scale that the rest of
-  // the chain (and the requant tail's stamped output_scale) is
-  // internally consistent with.
+  // Use the chain's reconstructed values as the source of truth — at
+  // this point we've cross-checked them against the operand's runtime
+  // quant (BlockArg arg-attr or op-defined type stamp) so the fused
+  // add's runtime dequant of this operand will agree.
   outScale = *scaleConstF;
   outZp = static_cast<int64_t>(std::lround(*zpConstF));
   return cast.getInput();

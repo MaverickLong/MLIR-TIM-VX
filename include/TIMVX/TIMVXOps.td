@@ -174,12 +174,26 @@ def TIMVX_MatMulOp : TIMVX_FuncTypeOp<"matmul", [NoMemoryEffect]> {
 }
 
 def TIMVX_FullyConnectedOp : TIMVX_FuncTypeOp<"fully_connected", [Pure]> {
-  let summary = "Fully-connected (dense) layer: Y = X @ Wt + b.";
+  let summary = "Fully-connected (dense) layer: Y = W^T @ X + b.";
   let description = [{
-    Computes `output = input @ weight^T + bias`. Input is rank-2
-    [batch, in_features]; weight is rank-2 [out_features, in_features];
-    bias is rank-1 [out_features]. Lowers to tim::vx::ops::FullyConnected
-    with axis=1 (input is already coerced to 2-D, dim 1 onward = features).
+    Computes `output[m, b] = sum_k(weight[k, m] * input[k, b]) + bias[m]`.
+    Tensors follow the TIM-VX inner-first convention with the
+    contraction axis K at index 0:
+
+      input:  rank-2 `{K, batch}`               (K innermost)
+      weight: rank-2 `{K, out_features}`        (K innermost)
+      bias:   rank-1 `{out_features}`
+      output: rank-2 `{out_features, batch}`    (out_features innermost)
+
+    Lowers to tim::vx::ops::FullyConnected with axis=0 (the contraction
+    dim is at index 0 of input). This matches the convention the
+    `vsi_nn_op_fullconnect2.c` kernel walks bytes in — it internally
+    reshapes input/output to `{K, batch}` / `{ofm, batch}` before
+    dispatching to `vxFullyConnectedLayer`. The earlier
+    `{batch, K}` / `axis=1` form happened to give correct `num_fc *
+    num_no_fc` arithmetic for batch=1, but produced column-permuted
+    output bytes because the weight bytes were laid out for the
+    transposed contraction axis.
   }];
 
   let arguments = (ins

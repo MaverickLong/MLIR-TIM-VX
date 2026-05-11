@@ -32,9 +32,14 @@
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <cstring>
 
 namespace mlir {
 namespace timvx {
@@ -307,6 +312,197 @@ std::string fmtStaticArrayDecl(ElementsAttr values, StringRef name) {
   return out;
 }
 
+// Pack a value range into raw machine-byte storage in TIM-VX innermost-
+// first order. The output is a plain memcpy of the reordered scalar
+// elements — exactly what `graph->CreateTensor(spec, data)` consumes.
+template <typename T>
+SmallVector<uint8_t> packReorderedRaw(ArrayRef<T> values,
+                                       ArrayRef<int64_t> shape) {
+  auto reordered = reorderMlirToTvx<T>(values, shape);
+  SmallVector<uint8_t> out(reordered.size() * sizeof(T));
+  if (!reordered.empty())
+    std::memcpy(out.data(), reordered.data(), out.size());
+  return out;
+}
+
+// Extract a `timvx.const`'s storage as raw machine bytes in TIM-VX
+// innermost-first order. Mirrors `fmtStaticArrayDecl`'s element-type
+// dispatch, but emits a flat byte vector instead of C++ literal text.
+//
+// On success, fills `out` and returns true. Returns false for element
+// types/storage flavours we don't pack (sub-byte ints, non-1/8/16/32/64
+// widths, unhandled resource attrs) — callers fall back to the inline
+// array path, which renders or also fails the same way.
+bool extractReorderedBytes(ElementsAttr values,
+                            SmallVectorImpl<uint8_t> &out) {
+  auto rt = cast<RankedTensorType>(values.getType());
+  Type elem = rt.getElementType();
+  ArrayRef<int64_t> shape = rt.getShape();
+  uint64_t numel = rt.getNumElements();
+
+  if (auto floats = values.tryGetValues<APFloat>()) {
+    SmallVector<APFloat> mlir_vals;
+    mlir_vals.reserve(numel);
+    for (APFloat v : *floats) mlir_vals.push_back(v);
+    auto reordered = reorderMlirToTvx<APFloat>(mlir_vals, shape);
+    if (elem.isF32()) {
+      out.resize(numel * sizeof(float));
+      auto *p = reinterpret_cast<float *>(out.data());
+      for (size_t i = 0; i < numel; ++i)
+        p[i] = reordered[i].convertToFloat();
+      return true;
+    }
+    if (elem.isF64()) {
+      out.resize(numel * sizeof(double));
+      auto *p = reinterpret_cast<double *>(out.data());
+      for (size_t i = 0; i < numel; ++i)
+        p[i] = reordered[i].convertToDouble();
+      return true;
+    }
+    if (elem.isF16()) {
+      // Stored as raw u16 bits (matches cxxScalarType's "uint16_t" mapping).
+      out.resize(numel * sizeof(uint16_t));
+      auto *p = reinterpret_cast<uint16_t *>(out.data());
+      for (size_t i = 0; i < numel; ++i)
+        p[i] = static_cast<uint16_t>(
+            reordered[i].bitcastToAPInt().getZExtValue());
+      return true;
+    }
+    return false;
+  }
+
+  if (auto ints = values.tryGetValues<APInt>()) {
+    Type stored = elem;
+    if (auto qt = dyn_cast<quant::QuantizedType>(elem))
+      stored = qt.getStorageType();
+    auto it = dyn_cast<IntegerType>(stored);
+    if (!it) return false;
+    unsigned width = it.getWidth();
+    auto pack = [&](auto sample) {
+      using U = decltype(sample);
+      SmallVector<U> mlir_vals;
+      mlir_vals.reserve(numel);
+      for (APInt v : *ints) mlir_vals.push_back(static_cast<U>(v.getZExtValue()));
+      out = packReorderedRaw<U>(mlir_vals, shape);
+    };
+    switch (width) {
+    case 1:
+    case 8:  pack(uint8_t{});  return true;
+    case 16: pack(uint16_t{}); return true;
+    case 32: pack(uint32_t{}); return true;
+    case 64: pack(uint64_t{}); return true;
+    default: return false;
+    }
+  }
+
+  // Resource-attr fast paths: data is already a flat raw-byte buffer in
+  // MLIR row-major order. Permute it into TIM-VX innermost-first.
+  auto reorderResourceRaw = [&](const void *src, size_t elemSize) {
+    auto m = tvxToMlirIndexMap(shape);
+    out.resize(numel * elemSize);
+    auto *bytes = reinterpret_cast<const uint8_t *>(src);
+    for (size_t i = 0; i < numel; ++i)
+      std::memcpy(out.data() + i * elemSize,
+                  bytes + m[i] * elemSize, elemSize);
+  };
+
+  if (auto r = dyn_cast<DenseF32ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), sizeof(float));
+    return true;
+  }
+  if (auto r = dyn_cast<DenseF64ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), sizeof(double));
+    return true;
+  }
+  if (auto r = dyn_cast<DenseI8ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), 1);
+    return true;
+  }
+  if (auto r = dyn_cast<DenseI16ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), 2);
+    return true;
+  }
+  if (auto r = dyn_cast<DenseI32ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), 4);
+    return true;
+  }
+  if (auto r = dyn_cast<DenseI64ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), 8);
+    return true;
+  }
+  if (auto r = dyn_cast<DenseUI8ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), 1);
+    return true;
+  }
+  if (auto r = dyn_cast<DenseUI16ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), 2);
+    return true;
+  }
+  if (auto r = dyn_cast<DenseUI32ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), 4);
+    return true;
+  }
+  if (auto r = dyn_cast<DenseUI64ResourceElementsAttr>(values)) {
+    auto data = r.tryGetAsArrayRef();
+    if (!data) return false;
+    reorderResourceRaw(data->data(), 8);
+    return true;
+  }
+  return false;
+}
+
+// Write `bytes` to `<dir>/<filename>`. Returns failure() and emits to
+// llvm::errs on I/O error. Used by the const-externalization pre-walk.
+LogicalResult writeBytesToFile(StringRef dir, StringRef filename,
+                                ArrayRef<uint8_t> bytes) {
+  SmallString<256> path(dir);
+  llvm::sys::path::append(path, filename);
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_None);
+  if (ec) {
+    llvm::errs() << "[timvx-to-emitc] cannot open " << path << " for write: "
+                 << ec.message() << "\n";
+    return failure();
+  }
+  os.write(reinterpret_cast<const char *>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+  os.close();
+  if (os.has_error()) {
+    llvm::errs() << "[timvx-to-emitc] write to " << path << " failed\n";
+    return failure();
+  }
+  return success();
+}
+
+// Per-const externalization decision filled by the pre-walk in the pass
+// driver and consumed by `ConstToEmitC`. Every `timvx.const` lives in
+// the map; `externalized=false` means "fall through to the inline-array
+// path" (either too small, no extern-dir set, or unsupported storage).
+struct ExternConstInfo {
+  unsigned id = 0;
+  bool externalized = false;
+  std::string filename;  // basename, no directory prefix
+  size_t byteSize = 0;
+};
+
 // Format a double as a float literal that's always parseable by C++:
 // `%.10g` alone can drop the decimal point (e.g. `1` for 1.0), which
 // chains with the `f` suffix to an invalid token `1f`.
@@ -458,27 +654,51 @@ struct ConstShapeToEmitC : public OpConversionPattern<ConstShapeOp> {
   }
 };
 
-// timvx.const -> timvx_runtime::const_tensor(graph, spec, &<data>[0]).
+// timvx.const -> timvx_runtime::const_tensor(graph, spec, <data>).
 //
-// The const op's data is reified into a function-local
-// `static const T <name>[N] = { … };` declaration emitted before the
-// call, and the call passes the array name (which decays to a const T*).
-// Weights are baked into the compiled binary — no separate weights file.
+// One of two C++ forms is emitted just before the call site, both
+// resolving to a `const T*` named `_timvx_const_<id>`:
+//
+//   inline:    static const T _timvx_const_<id>[N] = { v0, v1, ... };
+//   external:  static const T *_timvx_const_<id> =
+//                  static_cast<const T *>(::timvx_runtime::mmap_const(
+//                      "_timvx_const_<id>.bin", N_bytes));
+//
+// The choice is made up-front by the pass's pre-walk (see
+// `runOnOperation`) and recorded in `externMap` so this pattern just
+// reads it back. Both forms decay to `const void*` at the call site.
 struct ConstToEmitC : public OpConversionPattern<ConstOp> {
-  unsigned *counter;
-  ConstToEmitC(const TypeConverter &tc, MLIRContext *ctx, unsigned *c)
-      : OpConversionPattern<ConstOp>(tc, ctx), counter(c) {}
+  const llvm::DenseMap<Operation *, ExternConstInfo> *externMap;
+  ConstToEmitC(const TypeConverter &tc, MLIRContext *ctx,
+                const llvm::DenseMap<Operation *, ExternConstInfo> *m)
+      : OpConversionPattern<ConstOp>(tc, ctx), externMap(m) {}
   LogicalResult
   matchAndRewrite(ConstOp op, OpAdaptor,
                   ConversionPatternRewriter &rewriter) const final {
     auto values = cast<ElementsAttr>(op.getValuesAttr());
+    auto rt = cast<RankedTensorType>(values.getType());
+    StringRef cxxType = cxxScalarType(rt.getElementType());
 
-    std::string name = "_timvx_const_" + std::to_string((*counter)++);
-    std::string decl = fmtStaticArrayDecl(values, name);
-    if (decl.empty())
+    auto it = externMap->find(op.getOperation());
+    if (it == externMap->end())
       return rewriter.notifyMatchFailure(
-          op, "unsupported element type / storage for constant data");
+          op, "missing externMap entry (pre-walk skipped this op)");
+    const ExternConstInfo &info = it->second;
+    std::string name = "_timvx_const_" + std::to_string(info.id);
 
+    std::string decl;
+    if (info.externalized) {
+      llvm::raw_string_ostream os(decl);
+      os << "static const " << cxxType << " *" << name
+         << " = static_cast<const " << cxxType << " *>("
+         << "::timvx_runtime::mmap_const(\"" << info.filename << "\", "
+         << info.byteSize << "));";
+    } else {
+      decl = fmtStaticArrayDecl(values, name);
+      if (decl.empty())
+        return rewriter.notifyMatchFailure(
+            op, "unsupported element type / storage for constant data");
+    }
     emitc::VerbatimOp::create(rewriter, op.getLoc(),
                               rewriter.getStringAttr(decl));
 
@@ -768,11 +988,62 @@ void prependGraphParam(func::FuncOp func) {
 
 struct TIMVXToEmitCPass
     : public impl::TIMVXToEmitCPassBase<TIMVXToEmitCPass> {
+  using impl::TIMVXToEmitCPassBase<TIMVXToEmitCPass>::TIMVXToEmitCPassBase;
+
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
 
     for (auto func : llvm::to_vector(getOperation().getOps<func::FuncOp>()))
       prependGraphParam(func);
+
+    // Pre-walk: assign each `timvx.const` a stable id (in walk order) and,
+    // when the option is enabled and the const is large enough, materialize
+    // its raw bytes into an `_timvx_const_<id>.bin` file under
+    // `extern-const-dir`. The resulting per-op decision is consumed by
+    // `ConstToEmitC` below — keeping the file I/O outside the pattern
+    // avoids re-writing the same file if the pattern is re-applied during
+    // partial conversion's match/rewrite churn.
+    llvm::DenseMap<Operation *, ExternConstInfo> externMap;
+    StringRef externDir = this->externConstDir;
+    uint64_t externThreshold = this->externConstThreshold;
+    size_t externCount = 0, externBytes = 0;
+    {
+      unsigned id = 0;
+      auto walkResult = getOperation().walk([&](ConstOp op) -> WalkResult {
+        ExternConstInfo info;
+        info.id = id++;
+        auto values = cast<ElementsAttr>(op.getValuesAttr());
+        uint64_t numel =
+            cast<RankedTensorType>(values.getType()).getNumElements();
+        if (!externDir.empty() && numel > externThreshold) {
+          SmallVector<uint8_t> bytes;
+          if (extractReorderedBytes(values, bytes)) {
+            info.filename =
+                "_timvx_const_" + std::to_string(info.id) + ".bin";
+            info.byteSize = bytes.size();
+            if (failed(writeBytesToFile(externDir, info.filename, bytes)))
+              return WalkResult::interrupt();
+            info.externalized = true;
+            ++externCount;
+            externBytes += info.byteSize;
+          }
+          // If extractReorderedBytes failed (unsupported storage), fall
+          // through to the inline path; it will either render or also
+          // fail, with the same diagnostic surface as before.
+        }
+        externMap[op.getOperation()] = info;
+        return WalkResult::advance();
+      });
+      if (walkResult.wasInterrupted()) {
+        signalPassFailure();
+        return;
+      }
+    }
+    if (externCount > 0) {
+      llvm::errs() << "[timvx-to-emitc] externalized " << externCount
+                   << " timvx.const op(s) totalling " << externBytes
+                   << " bytes to " << externDir << "\n";
+    }
 
     TIMVXToEmitCTypeConverter converter(ctx);
 
@@ -796,8 +1067,7 @@ struct TIMVXToEmitCPass
     populateReturnOpTypeConversionPattern(patterns, converter);
     populateCallOpTypeConversionPattern(patterns, converter);
 
-    unsigned constCounter = 0;
-    patterns.add<ConstToEmitC>(converter, ctx, &constCounter);
+    patterns.add<ConstToEmitC>(converter, ctx, &externMap);
 
     patterns.add<ConstShapeToEmitC, ClipToEmitC, Conv2DToEmitC,
                  Pool2DToEmitC, TransposeToEmitC, CastToEmitC,

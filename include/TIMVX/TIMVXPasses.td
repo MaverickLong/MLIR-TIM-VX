@@ -322,13 +322,172 @@ def TIMVXQuantResidualFusePass
     `output_zp`. Mismatches fall through (the chain isn't a pure
     rescale chain).
 
-    Runs after `--tosa-to-timvx`; idempotent.
+    Run order: `tosa-to-timvx → canonicalize →`
+    **`timvx-quant-residual-fuse`** `→ canonicalize → timvx-promote-i8-to-u8`.
+    QRF MUST run before `--timvx-promote-i8-to-u8`: the matcher and
+    cross-checks expect the canonical i8-space TFLite chain (`cast(i8→f32)
+    → sub(zp_i8) → mul → … → mul(1/Sout) → add(zp_i8) → cast(f32→i8)`).
+    Once promote injects ±128 byte-shift compensation around every f32↔u8
+    cast, the chain shape varies (fold-in-place vs separate `add(+128)`
+    op depending on zp-const sharing) and the matcher can't reliably
+    discriminate. Running QRF first means it sees the canonical i8 chain
+    everywhere; promote then handles BOTH the fused `timvx.add` (bump
+    its `output_zp` by +128) AND any un-fused dequant chains (insert
+    ±128 compensation) with a single consistent rule.
+
+    Correctness limitation when paired with `tosa-quant-anchor`'s
+    `Sw=1/128` convention path: the convention stamps a CONVENTION
+    scale on conv outputs whose TFLite-real scale isn't recoverable
+    locally. The TFLite-real scale lives only in the dequant chain's
+    mul const. The un-fused chain works because TIM-VX `cast` ignores
+    the type stamp; QRF replaces the chain with a `timvx.add` whose
+    runtime dequant reads from the type stamp — divergent scales lead
+    to wrong output by `chain_S / type_S`. `matchDequantChain` adds a
+    LOCAL cross-check (S+Z chain const vs operand type stamp) that
+    soft-fails on disagreement; this prevents emitting a single wrong
+    fused add but does NOT prevent the cascade where an upstream
+    convention-anchored conv feeds a downstream chain whose own
+    scales locally match. For full correctness on models that hit
+    the convention path (TFLite resnet-style, mixed symmetric +
+    asymmetric quant), pass `--no-fuse`. See the source-file header
+    comment in `TimvxQuantResidualFuse.cpp` for the full analysis.
   }];
 
   let constructor = "::mlir::timvx::createTIMVXQuantResidualFusePass()";
 
   let dependentDialects = [
       "::mlir::timvx::TIMVXDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// timvx-dequant-fuse
+//===----------------------------------------------------------------------===//
+
+def TIMVXDequantFusePass
+    : Pass<"timvx-dequant-fuse", "::mlir::ModuleOp"> {
+  let summary = "Collapse `cast(int_q→f32) + sub(zp) + mul(scale)` into a "
+                "single `timvx.dataconvert` (int→f32 dequantize).";
+
+  let description = [{
+    Replaces the per-operand dequant chain with a single
+    `tim::vx::ops::DataConvert` call. DataConvert reads (S, Z) off the
+    input tensor's `quant.uniform` element type and produces
+    `f32 = (byte − Z) × S` natively in one NN-engine kernel dispatch,
+    instead of three GC kernel launches for cast + sub + mul.
+
+    Pattern matched (the `sub` is omitted when Z == 0 — canonicalize
+    folds `sub _, 0.0`):
+
+    ```
+    %f = timvx.cast %u8q : (<...x!quant.uniform<u8:f32, S:Z>>) -> <...xf32>
+    %n = timvx.sub %f, %zp_const_f32   // optional
+    %r = timvx.multiply %n, %scale_const_f32
+    ```
+
+    becomes
+
+    ```
+    %r = timvx.dataconvert %u8q : (<...x!quant.uniform<u8:f32, S:Z>>) -> <...xf32>
+    ```
+
+    Cross-checks `scale_const ≈ S` and `zp_const ≈ Z`; if they disagree
+    the chain isn't a standard dequant (e.g. a TFLite-published
+    `Si != S_type` case) and the rewrite bails — the `cast + sub + mul`
+    stays.
+
+    Does NOT handle the f32→int requant direction
+    (`mul → add → cast(f32→u8)`): DataConvert COMPILE_FAILs for
+    f32→int on VIP9000Nano-DI even though `vsi_nn_op_dataconvert.c`'s
+    op_check table claims support — see the comment on
+    `TIMVX_DataConvertOp` in `TIMVXOps.td`.
+
+    Run order: `…→ timvx-quant-residual-fuse → canonicalize →`
+    **`timvx-dequant-fuse`** `→ timvx-conv1x1-to-fc → timvx-to-emitc`.
+    QRF runs first because its pattern relies on the un-fused
+    `cast+sub+mul` shape to recognise the residual-add operand chains.
+  }];
+
+  let constructor = "::mlir::timvx::createTIMVXDequantFusePass()";
+
+  let dependentDialects = [
+      "::mlir::timvx::TIMVXDialect",
+      "::mlir::quant::QuantDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// timvx-canonicalize-transpose
+//===----------------------------------------------------------------------===//
+
+def TIMVXCanonicalizeTransposePass
+    : Pass<"timvx-canonicalize-transpose", "::mlir::ModuleOp"> {
+  let summary = "Push timvx.transpose ops upward through see-through "
+                "elementwise ops until they cancel or hit a layout-locked op.";
+
+  let description = [{
+    `tosa-to-timvx` sandwiches every spatial op (conv2d / pool2d) between
+    an NHWC↔WHCN transpose pair so the spatial op runs in TIM-VX's native
+    inner-first WHCN layout. The post-spatial transpose returns to NHWC
+    for the trailing TOSA elementwise chain (cast / sub / multiply / add
+    / clip / dataconvert / slice), and the pre-next-spatial transpose
+    flips back to WHCN. When two adjacent spatial ops are separated only
+    by an elementwise chain, those two transposes are mutually inverse
+    (`{3,1,0,2} ∘ {2,1,3,0} = identity`) — the only reason they exist is
+    that the elementwise ops were inserted in NHWC at TOSA time.
+
+    This pass pushes each transpose upward through its producer one op at
+    a time:
+
+      * `unary(x)` → `transpose(unary(x)) = unary(transpose(x))`
+        (`timvx.cast`, `timvx.dataconvert`, `timvx.clip`). Result type is
+        the operand's type permuted by `perms`.
+      * `binary(a, b)` →
+        `transpose(binary(a, b)) = binary(transpose(a), transpose(b))`
+        (`timvx.add`, `timvx.sub`, `timvx.multiply`). Each operand gets
+        its own wrapped transpose; broadcast (numel == 1) constants stay
+        scalar.
+      * `slice(t, start, size)` →
+        `transpose(slice(t, start, size)) =
+         slice(transpose(t), perm(start), perm(size))`.
+        `start` and `size` are operand consts (`1DTensorOf<Index>`); the
+        rewrite emits new `tosa.const_shape` ops with permuted values.
+      * `timvx.const` (constant tensor) → materialise a new
+        `timvx.const` whose dense storage is physically permuted by
+        `perms`. For 1×1×…×1 broadcast scalars this is a no-op rebuild
+        (same data); for full-rank consts the rotation is paid once at
+        compile time.
+      * `transpose(transpose(x))` →  composed perms; identity drops both.
+        This is the cancellation step that actually retires transposes
+        — once both halves of a sandwich pair have walked up to the
+        same producer, the composed perm is identity and both are
+        erased.
+
+    Barriers (transpose stops here, no rewrite): `timvx.conv2d`,
+    `timvx.pool2d`, `timvx.fully_connected`, `timvx.reshape`,
+    `timvx.reduce_sum`, `timvx.pad`, function arguments, and any op
+    whose result has more than one user (pushing the transpose past a
+    fan-out would re-permute every other consumer's view of the data).
+
+    The pass runs after `timvx-promote-i8-to-u8` and before
+    `timvx-to-emitc`, against an IR where every elementwise op is
+    layout-agnostic (per-element math, scalar consts) and the only
+    layout-locked ops are conv / pool / FC / reshape. On a resnet18 lower
+    this collapses 26 transposes down to 2 (the entry NCHW→WHCN and the
+    exit reshape→transpose into the model's row-major output spec).
+    Constant operands hit by the propagation are folded to permuted
+    `timvx.const`s; runtime sees no extra transposes.
+
+    Run order: `... → timvx-promote-i8-to-u8 → canonicalize →
+                **timvx-canonicalize-transpose** → timvx-conv1x1-to-fc →
+                timvx-to-emitc`.
+  }];
+
+  let constructor = "::mlir::timvx::createTIMVXCanonicalizeTransposePass()";
+
+  let dependentDialects = [
+      "::mlir::timvx::TIMVXDialect",
+      "::mlir::tosa::TosaDialect"
   ];
 }
 
@@ -349,6 +508,16 @@ def TIMVXToEmitCPass : Pass<"timvx-to-emitc", "::mlir::ModuleOp"> {
     are formatted in-place as opaque C++ text. The `graph` argument is
     referenced as a free identifier — the surrounding function is expected to
     have one in scope.
+
+    Const externalization: when `extern-const-dir` is set, every `timvx.const`
+    whose element count exceeds `extern-const-threshold` (default 1024) is
+    written to a raw `.bin` file under that directory (in TIM-VX innermost-
+    first byte order, matching `graph->CreateTensor(spec, data)`'s ABI). The
+    emitted C++ replaces the `static const T name[N] = {…};` array with a
+    `static const T *name = mmap_const("name.bin", N_bytes);` initializer
+    that the runtime resolves against `$TIMVX_CONSTS_DIR` (env override) or
+    the directory of the running executable. Smaller consts (and all consts
+    when `extern-const-dir` is unset) keep the inline-array form.
   }];
 
   let constructor = "::mlir::timvx::createTIMVXToEmitCPass()";
@@ -357,6 +526,19 @@ def TIMVXToEmitCPass : Pass<"timvx-to-emitc", "::mlir::ModuleOp"> {
       "::mlir::timvx::TIMVXDialect",
       "::mlir::emitc::EmitCDialect",
       "::mlir::func::FuncDialect"
+  ];
+
+  let options = [
+    Option<"externConstDir", "extern-const-dir", "std::string",
+           /*default=*/"\"\"",
+           "Directory to write large `timvx.const` data into as raw `.bin` "
+           "files (one per externalized const). Empty (default) inlines "
+           "every const as a `static const T name[N] = {…};` array.">,
+    Option<"externConstThreshold", "extern-const-threshold", "uint64_t",
+           /*default=*/"1024",
+           "Numel threshold above which `timvx.const`s are written to "
+           "external `.bin` files (only honored when `extern-const-dir` is "
+           "set). Use 0 to externalize every const regardless of size.">
   ];
 }
 

@@ -138,12 +138,20 @@ ElementsAttr xorI8Bytes(ElementsAttr values, MLIRContext *ctx) {
 // caller skips inserting a new op when this fires. Only matches when the
 // RHS is a `timvx.const` with a single scalar f32 value (the canonical
 // shape RequantI32SkipFold and the TFLite dequant chain produce).
+//
+// When the const is shared (CSE'd across multiple users) we BAIL and let
+// the caller insert a separate `add(+128)` op. We don't clone-and-rewire
+// because the resulting clone-only chain (single `add(0)` instead of
+// `add(orig) → add(+128)`) was empirically observed to fail at
+// graph->Run on resnet18nofcv2 even though the math is identical — the
+// extra add seems to be load-bearing for the kernel selector. The
+// downstream QRF pattern handles the inserted-`add(+128)` shape via its
+// `walk_compensation_add` helper.
 template <typename BinOp>
 bool tryFoldDeltaIntoConst(BinOp op, double delta) {
   Value rhs = op.getInput2();
   auto cst = rhs.getDefiningOp<ConstOp>();
   if (!cst) return false;
-  if (!cst->hasOneUse()) return false;  // can't mutate a shared const
   auto valuesAttr = dyn_cast<DenseElementsAttr>(cst.getValuesAttr());
   if (!valuesAttr || !valuesAttr.isSplat()) return false;
   auto elemTy = cst.getType().getElementType();
@@ -154,6 +162,8 @@ bool tryFoldDeltaIntoConst(BinOp op, double delta) {
   double newD = v.convertToDouble() + delta;
   APFloat newF(static_cast<float>(newD));
   auto newAttr = DenseElementsAttr::get(cst.getType(), newF);
+
+  if (!cst->hasOneUse()) return false;  // can't mutate a shared const
   cst.setValuesAttr(newAttr);
   return true;
 }

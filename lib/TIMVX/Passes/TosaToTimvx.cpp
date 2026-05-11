@@ -711,8 +711,20 @@ struct RescaleConvFusion : public OpConversionPattern<tosa::RescaleOp> {
   }
 };
 
-// Standalone `tosa.rescale` (input not a tosa.conv2d): emit
-// `timvx.dataconvert` carrying (output_scale, output_zp) from QuantInfoMap.
+// Standalone `tosa.rescale`: emit `timvx.dataconvert` carrying
+// (output_scale, output_zp) from QuantInfoMap.
+//
+// Pattern benefit (1) is intentionally lower than `RescaleConvFusion`'s
+// (10) — when a rescale's input is a `tosa.conv2d`, the framework tries
+// fusion FIRST and only falls through to standalone when fusion bails
+// (per-channel weight, non-constant mul/shift, missing quant info, etc).
+// We deliberately do NOT skip conv2d-fed rescales here: the conv→rescale
+// chain is otherwise unhandled when fusion declines, and TIM-VX's
+// DataConvert handles `i32 → i8/u8` (NN-engine accumulator → per-tensor
+// requant) just as well as the `i8 → i8/u8` case the standalone path was
+// originally written for. The only price for not fusing is that the
+// conv2d emits its i32 accumulator separately and DataConvert then
+// requantizes it — semantically identical, just an extra op_create.
 struct RescaleStandaloneConversion
     : public OpConversionPattern<tosa::RescaleOp> {
   RescaleStandaloneConversion(MLIRContext *ctx, const QuantInfoMap &qm)
@@ -722,8 +734,6 @@ struct RescaleStandaloneConversion
   LogicalResult
   matchAndRewrite(tosa::RescaleOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
-    if (op.getInput().getDefiningOp<tosa::Conv2DOp>())
-      return rewriter.notifyMatchFailure(op, "conv-rescale fusion target");
     if (op.getPerChannel())
       return rewriter.notifyMatchFailure(op,
                                          "per-channel standalone rescale");
@@ -731,8 +741,15 @@ struct RescaleStandaloneConversion
     auto outTy = dyn_cast<RankedTensorType>(op.getType());
     if (!inTy || !outTy)
       return rewriter.notifyMatchFailure(op, "non-ranked tensor");
-    if (!isa<IntegerType>(inTy.getElementType()) ||
-        !isa<IntegerType>(outTy.getElementType()))
+    // Storage type may be wrapped in a `quant.uniform<i8:f32, …>` after
+    // `tosa-quant-anchor` ran — unwrap before the integer-only check.
+    auto storageOf = [](Type t) -> Type {
+      if (auto qt = dyn_cast<quant::QuantizedType>(t))
+        return qt.getStorageType();
+      return t;
+    };
+    if (!isa<IntegerType>(storageOf(inTy.getElementType())) ||
+        !isa<IntegerType>(storageOf(outTy.getElementType())))
       return rewriter.notifyMatchFailure(
           op, "DataConvert only supports int->int requantize on this chip");
 
