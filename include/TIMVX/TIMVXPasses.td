@@ -492,6 +492,93 @@ def TIMVXCanonicalizeTransposePass
 }
 
 //===----------------------------------------------------------------------===//
+// timvx-arith-fold
+//===----------------------------------------------------------------------===//
+
+def TIMVXArithFoldPass
+    : Pass<"timvx-arith-fold", "::mlir::ModuleOp"> {
+  let summary = "Collapse chained scalar-const add/sub/multiply ops into one.";
+
+  let description = [{
+    Constant-folds adjacent pairs of `timvx.add` / `timvx.sub` /
+    `timvx.multiply` whose second operand is a 1-element f32 splat
+    const. Targets the per-block dequant/requant chain shape that
+    `timvx-promote-i8-to-u8` leaves behind:
+
+      sub(sub(x, a), b) → sub(x, a + b)
+      add(add(x, a), b) → add(x, a + b)
+      add(sub(x, a), b) → add(x, b - a)
+      sub(add(x, a), b) → add(x, a - b)
+      multiply(multiply(x, a), b) → multiply(x, a * b)
+
+    Each fold removes a GC kernel dispatch — the ±128 byte-shift
+    compensation `timvx-promote-i8-to-u8` injects around every f32↔u8
+    cast leaves the head of each dequant chain as `sub → sub` and the
+    tail of every requant chain as `add → add`, and both pairs are
+    pure scalar arithmetic that folds at compile time.
+
+    Constraints: the inner op must be single-use (otherwise removing
+    it would lose the intermediate another consumer reads); both
+    constants must be reachable via `matchConstScalarFloat` (scalar
+    splat over a same-rank-as-x type). Per-channel `1×1×1×C` constants
+    are not folded — same-shape vector folding isn't needed for the
+    chains we emit.
+
+    Run order: `... → timvx-canonicalize-transpose → canonicalize →
+                **timvx-arith-fold** → canonicalize → timvx-cse → ...`.
+  }];
+
+  let constructor = "::mlir::timvx::createTIMVXArithFoldPass()";
+
+  let dependentDialects = [
+      "::mlir::timvx::TIMVXDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// timvx-cse
+//===----------------------------------------------------------------------===//
+
+def TIMVXCsePass : Pass<"timvx-cse", "::mlir::ModuleOp"> {
+  let summary = "Structural common-subexpression elimination over pure timvx ops.";
+
+  let description = [{
+    Walks the function in pre-order and dedupes every pure timvx op
+    that is structurally equivalent (same op name, same operand SSA
+    values, same declared attributes, same result types) to an
+    earlier op. The duplicate's result SSA uses are redirected to the
+    canonical op's results.
+
+    Motivation: the `timvx-canonicalize-transpose` pass's fan-out
+    propagation duplicates the producer when it pushes a transpose
+    past a multi-use op (each propagating path gets its own copy of
+    the producer at the permuted layout, while the original stays for
+    the other consumers). After two or three residual blocks, the
+    same upstream `timvx.dataconvert(u8 → f32)` ends up materialised
+    three to seven times — one per downstream block that re-reads the
+    skip operand. CSE collapses these back into a single op.
+
+    Why not upstream `--cse`: this pass is dialect-scoped (we don't
+    want CSE running over `func` or `tosa` ops at this stage) and
+    keeps the pipeline self-documenting. Uses `OperationEquivalence`
+    for hashing/equality, so it respects all declared attributes —
+    including `quant_scale` / `quant_zp` on `timvx.const`,
+    `output_scale` / `output_zp` on cast/dataconvert/transpose, and
+    kernel/stride/pad on conv2d/pool2d. Two ops with identical
+    operands but different quant context will NOT be merged.
+
+    Run order: `... → timvx-arith-fold → canonicalize → **timvx-cse** →
+                timvx-conv1x1-to-fc → timvx-to-emitc`.
+  }];
+
+  let constructor = "::mlir::timvx::createTIMVXCsePass()";
+
+  let dependentDialects = [
+      "::mlir::timvx::TIMVXDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // timvx-to-emitc
 //===----------------------------------------------------------------------===//
 

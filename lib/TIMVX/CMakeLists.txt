@@ -11,6 +11,8 @@ add_mlir_dialect_library(MLIRTIMVX
         Passes/TimvxQuantResidualFuse.cpp
         Passes/TimvxDequantFuse.cpp
         Passes/TimvxCanonicalizeTranspose.cpp
+        Passes/TimvxArithFold.cpp
+        Passes/TimvxCse.cpp
         Passes/TimvxToEmitC.cpp
 
         ADDITIONAL_HEADER_DIRS
