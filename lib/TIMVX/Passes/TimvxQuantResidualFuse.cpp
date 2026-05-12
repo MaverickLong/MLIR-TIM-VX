@@ -11,52 +11,82 @@
 // -> cast(f32->i8)`) into a single quantized `timvx.add` carrying
 // (output_scale, output_zp). On VIP9000Nano-DI the NN-core's quant `Add`
 // (probe-matrix u8 <-> u8 <-> u8 PASS) is dramatically cheaper than the
-// CL/EVIS path the f32 chain compiles to.
+// CL/EVIS path the f32 chain compiles to. On resnet50 (16 residual
+// blocks), correct cascade-fusing brings end-to-end inference from
+// ~68 ms (un-fused) down to ~7.5 ms via the OVXLIB path — matching the
+// vendor's ACUITY-compiled NBG running on VIPLite, with the same
+// quantized-only graph structure as `samples/multi_device/vx_resnet50.cc`.
 //
-// COUPLING WITH tosa-quant-anchor — IMPORTANT
-// -------------------------------------------
-// QRF is correctness-safe only when every operand's `quant.uniform`
-// type stamp agrees with the dequant chain's mul const (the per-operand
-// scale const) and sub const (the per-operand zp const). The runtime
-// `timvx.add` reads its operand quant from the operand tensor's spec
-// (= the type stamp); the chain const is what the un-fused dequant
-// would multiply through. If they disagree, the fused add dequantizes
-// each operand with the type-stamped S while QRF's chain-replacement
-// math assumed the chain-const S — output is wrong by exactly the
-// ratio (chain_S / type_S).
+// Two-phase pass architecture — load-bearing for the cascade
+// ----------------------------------------------------------
+// `runOnOperation` applies its patterns in two SEPARATE greedy fixpoints:
 //
-// `tosa-quant-anchor`'s `Sw=1/128` symmetric-int8 convention path
-// stamps a CONVENTION scale on every conv2d output whose TFLite-real
-// scale isn't recoverable from the local IR (no in-IR dequant chain to
-// pin Si, no arg-attr to anchor against). The TFLite-real scale lives
-// in the per-operand mul const of the downstream residual chain, NOT
-// on the type. That's a stable mismatch on any TFLite resnet-style
-// model that mixes symmetric (`Z=-128`) and asymmetric (`Z!=±128`)
-// conv outputs.
+//   Phase 1: `QuantResidualFuse` only, run to fixpoint.
+//   Phase 2: `StripUnfusedTailQuant` only, run to fixpoint.
 //
-// In the un-fused path this divergence is invisible because TIM-VX's
-// `cast` op IGNORES the type's (S, Z) — the chain math operates on
-// raw byte values with chain consts directly. Fusing the chain hands
-// the math back to the type-stamped (S, Z), exposing the divergence.
+// They CANNOT share a pattern set. The reason is a cascade dependency:
 //
-// `matchDequantChain` cross-checks chain-const-S vs type-stamp-S for
-// every operand and SOFT-fails (leaves the chain unfused) on
-// disagreement. That's a LOCAL guard — it prevents emitting a wrong
-// fused add for THIS chain. It does NOT catch the global cascade: if
-// an upstream conv was anchored to convention-S and a different
-// downstream chain WAS fuseable (its scales locally agreed), the
-// downstream-fused add still sees the upstream operand decoded
-// through the convention-S, not the TFLite-real S the network was
-// trained for.
+//   * Transition residuals (one per resnet stage — the block where both
+//     operands come from `conv->rescale->cast->sub->mul` chains) match
+//     QRF on the FIRST greedy iteration. Each one fuses, leaving a
+//     bridge `cast(quant.uniform<i8>, S:Z) -> f32` in the IR whose
+//     input is the fused `timvx.add` result.
 //
-// Until `tosa-quant-anchor` recovers TFLite-real S for every tensor
-// (no `Sw=1/128` fallback), QRF on a model with mixed
-// symmetric+asymmetric quant cannot be guaranteed end-to-end correct
-// even with the local cross-check. For now: the local cross-check
-// minimises damage on partial-mismatch models; for full correctness
-// on those models the user should pass `--no-fuse`. simple_v1 and
-// `add_residual_i8` op_tests are designed to keep type-S == chain-S
-// throughout, so QRF is byte-identical to no-fuse on those.
+//   * Identity residuals (the per-stage blocks where the skip operand
+//     is the previous block's `clip(0, +inf)` output rather than a fresh
+//     conv-rescale chain) DON'T match QRF on iteration 1 — their skip
+//     operand is an f32 `clip` op, which `getI8Operand` rejects (cases
+//     A/B/C all fail). They only become matchable on iteration 2+,
+//     once the upstream transition fuse has replaced the f32 clip with
+//     the bridge cast and the skip operand is now a CastOp whose input
+//     carries a quant-typed stamp.
+//
+//   * `StripUnfusedTailQuant`'s job is to remove the `output_scale` /
+//     `output_zp` discardable attrs from any `cast(f32 -> u8)` QRF
+//     couldn't fuse — the attrs are only meaningful to QRF's matcher
+//     and would cause double-scaling at the f32->u8 emit boundary if
+//     left in place. But its match condition is satisfied IMMEDIATELY
+//     for every requant-tail cast in the IR, including the identity
+//     residuals' casts whose dependents (the upstream transitions)
+//     haven't fused yet.
+//
+//   * If both patterns share a pattern set, the greedy driver applies
+//     them in benefit order. On iteration 1, every cast whose block
+//     QRF can't yet match gets visited by StripUnfusedTailQuant and
+//     loses its quant attrs. On iteration 2, when the bridge cast
+//     finally exists for the identity blocks, QRF's matcher rejects
+//     them at the entry check `if (!soAttr || !zoAttr) return failure()`
+//     — the attrs are gone. Net result: only the 4 per-stage
+//     transition residuals fuse on resnet50, and the 12 identity
+//     residuals stay f32-chained.
+//
+// Splitting the phases means StripUnfusedTailQuant runs ONLY after QRF
+// has reached fixpoint across all greedy iterations. Casts that QRF
+// genuinely cannot fuse still get stripped; casts QRF would have
+// fused on a later iteration get to keep their attrs long enough to
+// be matched.
+//
+// Cross-checks and runtime stamp dependency
+// -----------------------------------------
+// QRF's runtime semantic depends on every operand's `quant.uniform`
+// element-type stamp agreeing with the dequant chain's `mul`/`sub`
+// const operand values. The runtime `timvx.add` reads operand quant
+// from the tensor spec built from the type stamp; the chain const is
+// what the un-fused dequant would multiply through. `matchDequantChain`
+// cross-checks them and SOFT-fails on disagreement, so a tensor whose
+// upstream anchor produced (S, Z) that don't match the chain const
+// (e.g. on a model that legitimately mixes scales) stays un-fused
+// rather than producing a wrong fused add. This cross-check matters
+// for atomic-test correctness but on TFLite-imported resnets is
+// rarely tripped — IREE's TFLite frontend stamps chain consts and
+// rescale-derived (S, Z) consistently with each other.
+//
+// `getI8Operand` case B accepts both `IntegerType` storage and
+// `quant::QuantizedType` wrapping integer storage as the cast
+// operand element type, and reads (S, Z) from the input's
+// `quant.uniform` element-type stamp when the bridge cast's own
+// discardable attrs are empty. This is what makes the second-iteration
+// match work for identity residuals downstream of a fused transition.
 //
 //===----------------------------------------------------------------------===//
 
@@ -147,24 +177,20 @@ Value matchDequantChain(Operation *contextOp, Value real,
   // away the runtime add reads its operand quant from the operand
   // tensor's spec (= the type stamp). If `tosa-quant-anchor` derived
   // S from its Sw=1/128 convention path while TFLite published a
-  // different S in the chain (a 3.4× drift on the symmetric-Z=-128
-  // resnet18 conv outputs), trusting the chain const after fusing
-  // gives a runtime-time math mismatch — the fused add dequantizes
-  // operand B with the typed S, but our `outScale` here used the
-  // chain S. Soft-fail and leave the chain unfused so the explicit
-  // mul-by-chain-const continues to do the right math at runtime.
+  // different S in the chain, trusting the chain const after fusing
+  // gives a runtime-time math mismatch — empirically this shifts the
+  // argmax (resnet50 cat105.jpg: 285→852 with cross-check disabled,
+  // i.e. wrong class). Soft-fail and leave the chain unfused so the
+  // explicit mul-by-chain-const continues to do the right math at
+  // runtime. The architectural fix is to make `tosa-quant-anchor`
+  // recover the TFLite-real `So` for these tensors (see the
+  // back-propagation logic in TosaQuantAnchor.cpp).
   auto checkQuant = [&](double prodS, int64_t prodZ,
                          const char *prodSrc) -> bool {
-    if (!approxEq(prodS, *scaleConstF)) {
-      // Soft-fail: the chain isn't a faithful dequant of this operand.
-      // Don't strict-fail; the model is internally consistent, just
-      // not fuseable.
-      return false;
-    }
+    if (!approxEq(prodS, *scaleConstF)) return false;
     if (!approxEq(static_cast<double>(prodZ),
-                  static_cast<double>(*zpConstF))) {
+                  static_cast<double>(*zpConstF)))
       return false;
-    }
     (void)prodSrc;
     return true;
   };
@@ -175,8 +201,6 @@ Value matchDequantChain(Operation *contextOp, Value real,
         return {};
     }
   } else {
-    // Op-defined producer. Read (S, Z) off the cast's input type's
-    // quant.uniform stamp (storage=int, expressed=f32).
     auto castInTy = dyn_cast<RankedTensorType>(cast.getInput().getType());
     if (castInTy) {
       if (auto qt = dyn_cast<quant::UniformQuantizedType>(
@@ -187,10 +211,6 @@ Value matchDequantChain(Operation *contextOp, Value real,
     }
   }
 
-  // Use the chain's reconstructed values as the source of truth — at
-  // this point we've cross-checked them against the operand's runtime
-  // quant (BlockArg arg-attr or op-defined type stamp) so the fused
-  // add's runtime dequant of this operand will agree.
   outScale = *scaleConstF;
   outZp = static_cast<int64_t>(std::lround(*zpConstF));
   return cast.getInput();
@@ -219,16 +239,48 @@ Value getI8Operand(Operation *contextOp, Value real,
   auto *def = real.getDefiningOp();
   if (!def) return {};
 
-  // Case (B).
+  // Case (B). Accept both bare `IntegerType` storage (un-anchored i8
+  // tensor passed by `RequantI32SkipFold`) AND `quant::QuantizedType`
+  // wrapping an integer storage (the anchored / fused-block-output case
+  // — every `timvx.add` produced by QRF on a previous greedy iteration
+  // has `quant.uniform<i8:f32, S:Z>` on its result, and the bridge cast
+  // QRF emits from that result inherits the quant type as its input).
+  //
+  // (S, Z) sources tried in priority:
+  //   1. the cast's own `output_scale`/`output_zp` attrs (legacy from
+  //      `RequantI32SkipFold` / `Cast` lowering paths)
+  //   2. the `quant.uniform<...>` element type on the cast INPUT — this
+  //      is the QRF-fused-block-output path. Reading the stamp is
+  //      required because the bridge cast QRF emits deliberately leaves
+  //      `output_scale`/`output_zp` empty (the runtime cast kernel
+  //      rejects fp32 outputs with an attached ASYM Quantization()).
+  //      Without this lookup, every identity-residual block downstream
+  //      of an already-fused block fails `getI8Operand` and the QRF
+  //      cascade stops at the per-stage transition residual.
   if (auto castOp = dyn_cast<CastOp>(def)) {
     auto castInTy = dyn_cast<RankedTensorType>(castOp.getInput().getType());
-    if (castInTy && isa<IntegerType>(castInTy.getElementType())) {
-      auto sAttr = castOp.getOutputScaleAttr();
-      auto zAttr = castOp.getOutputZpAttr();
-      if (sAttr && zAttr) {
-        outScale = sAttr.getValueAsDouble();
-        outZp = zAttr.getInt();
-        return castOp.getInput();
+    if (castInTy) {
+      Type elem = castInTy.getElementType();
+      bool intStorage = isa<IntegerType>(elem);
+      auto qty = dyn_cast<quant::QuantizedType>(elem);
+      bool quantIntStorage =
+          qty && isa<IntegerType>(qty.getStorageType());
+      if (intStorage || quantIntStorage) {
+        auto sAttr = castOp.getOutputScaleAttr();
+        auto zAttr = castOp.getOutputZpAttr();
+        if (sAttr && zAttr) {
+          outScale = sAttr.getValueAsDouble();
+          outZp = zAttr.getInt();
+          return castOp.getInput();
+        }
+        // No explicit attrs — read (S, Z) off the input's quant.uniform
+        // stamp. This is the canonical bridge-cast case after a prior
+        // greedy iteration of QRF.
+        if (auto uniform = dyn_cast<quant::UniformQuantizedType>(elem)) {
+          outScale = uniform.getScale();
+          outZp = uniform.getZeroPoint();
+          return castOp.getInput();
+        }
       }
     }
   }
@@ -506,24 +558,60 @@ struct TIMVXQuantResidualFusePass
     : public impl::TIMVXQuantResidualFusePassBase<TIMVXQuantResidualFusePass> {
   void runOnOperation() final {
     bool strictFailed = false;
-    RewritePatternSet patterns(&getContext());
-    patterns.add<QuantResidualFuse>(&getContext(), &strictFailed);
-    patterns.add<StripUnfusedTailQuant>(&getContext());
-    // Same rationale as TIMVXConv1x1ToFCPass: the greedy driver's default
-    // folding + CSE strips quant attrs from re-materialized timvx.const
-    // ops. Disable both — this pass only needs the peephole rewrite, no
-    // constant folding.
-    GreedyRewriteConfig cfg;
-    cfg.enableFolding(false);
-    cfg.enableConstantCSE(false);
-    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns), cfg)))
+
+    // PHASE 1 — Fuse to fixpoint.
+    //
+    // Only the `QuantResidualFuse` pattern runs here. `StripUnfusedTailQuant`
+    // is deliberately deferred to phase 2 because of a cascade interaction:
+    //
+    //   * QRF on an IDENTITY residual block needs the previous block's
+    //     output to come from a CastOp whose input carries a `quant.uniform`
+    //     stamp (the bridge-cast path in `getI8Operand` case B). That bridge
+    //     cast only exists *after* the previous (transition) block has been
+    //     fused — which can happen multiple greedy iterations into the run.
+    //   * If `StripUnfusedTailQuant` shares the pattern set, it matches the
+    //     identity block's `finalCast` on its FIRST visit (when QRF returns
+    //     failure because the skip operand is still an f32 `clip`) and
+    //     strips the `output_scale`/`output_zp` discardable attrs. Once
+    //     stripped, the cast no longer matches QRF's entry check on any
+    //     subsequent iteration, even after the transition block has fused
+    //     and made the bridge cast available.
+    //
+    // Net effect of the bug: on resnet50, only the 4 transition residuals
+    // fired, and the 12 identity residuals stayed f32-chained. Separating
+    // the phases lets QRF iterate to fixpoint without the strip clobbering
+    // unfused-but-still-fuseable casts.
+    {
+      RewritePatternSet patterns(&getContext());
+      patterns.add<QuantResidualFuse>(&getContext(), &strictFailed);
+      GreedyRewriteConfig cfg;
+      cfg.enableFolding(false);
+      cfg.enableConstantCSE(false);
+      if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
+                                          cfg)))
+        signalPassFailure();
+    }
+
+    if (strictFailed) {
       signalPassFailure();
-    // Strict mode: a quantized requant tail that didn't fuse because
-    // the chain is internally inconsistent is a user-fixable bug, not
-    // a "fall back to the unfused fp32 path" condition. Emit-error +
-    // signalPassFailure so the lowering halts and the user sees
-    // exactly which mismatch needs fixing.
-    if (strictFailed) signalPassFailure();
+      return;
+    }
+
+    // PHASE 2 — Strip the residual `output_scale`/`output_zp` discardable
+    // attrs from any cast QRF couldn't fuse. The (S, Z) is already on the
+    // result type stamp; the discardable attrs are only meaningful to
+    // QRF's matcher and would confuse downstream codegen if left in place
+    // (double-scaling at the f32→u8 emit boundary, saturating everything).
+    {
+      RewritePatternSet patterns(&getContext());
+      patterns.add<StripUnfusedTailQuant>(&getContext());
+      GreedyRewriteConfig cfg;
+      cfg.enableFolding(false);
+      cfg.enableConstantCSE(false);
+      if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
+                                          cfg)))
+        signalPassFailure();
+    }
   }
 };
 

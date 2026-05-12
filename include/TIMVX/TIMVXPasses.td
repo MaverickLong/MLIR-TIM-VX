@@ -335,22 +335,38 @@ def TIMVXQuantResidualFusePass
     its `output_zp` by +128) AND any un-fused dequant chains (insert
     ±128 compensation) with a single consistent rule.
 
-    Correctness limitation when paired with `tosa-quant-anchor`'s
-    `Sw=1/128` convention path: the convention stamps a CONVENTION
-    scale on conv outputs whose TFLite-real scale isn't recoverable
-    locally. The TFLite-real scale lives only in the dequant chain's
-    mul const. The un-fused chain works because TIM-VX `cast` ignores
-    the type stamp; QRF replaces the chain with a `timvx.add` whose
-    runtime dequant reads from the type stamp — divergent scales lead
-    to wrong output by `chain_S / type_S`. `matchDequantChain` adds a
-    LOCAL cross-check (S+Z chain const vs operand type stamp) that
-    soft-fails on disagreement; this prevents emitting a single wrong
-    fused add but does NOT prevent the cascade where an upstream
-    convention-anchored conv feeds a downstream chain whose own
-    scales locally match. For full correctness on models that hit
-    the convention path (TFLite resnet-style, mixed symmetric +
-    asymmetric quant), pass `--no-fuse`. See the source-file header
-    comment in `TimvxQuantResidualFuse.cpp` for the full analysis.
+    Cascade through identity residuals: on TFLite-imported resnet-style
+    models, only the per-stage "transition" residual block (where both
+    operands come from fresh `conv → rescale → cast → sub → mul` chains)
+    matches QRF on the first greedy iteration. The "identity" residuals
+    that follow — where the skip operand is the previous block's
+    `clip(0, +inf)` output, not a fresh chain — only become matchable
+    *after* the upstream transition fuses and replaces the f32 clip
+    with a bridge `cast(quant.uniform<u8>, S:Z) → f32` whose input the
+    matcher can pick up via `getI8Operand` case B. The implementation
+    runs `QuantResidualFuse` and `StripUnfusedTailQuant` in TWO
+    SEPARATE phases for this reason (see the file-header comment in
+    `TimvxQuantResidualFuse.cpp`): if they shared a pattern set, the
+    strip pattern would erase the `output_scale`/`output_zp` discardable
+    attrs from the identity-residual casts on iteration 1 (when QRF
+    can't yet match them), and on iteration 2 QRF's entry check would
+    reject them because the attrs are gone. With the phases separated,
+    QRF reaches fixpoint across all greedy iterations before the strip
+    runs, so the cascade unfolds correctly: transition fuses → bridge
+    cast appears → next identity fuses → ... and on resnet50 all 16
+    residuals fuse, end-to-end inference reaches ~7.5 ms (matches the
+    vendor ACUITY NBG baseline).
+
+    Cross-check: `matchDequantChain` checks the per-operand chain
+    `mul scale_const`/`sub zp_const` against the cast input's
+    `quant.uniform` type stamp and soft-fails on disagreement, so
+    operand stamps that don't match the chain consts (rare on
+    properly-anchored IR, but possible if `tosa-quant-anchor`'s
+    `Sw=1/128` convention path stamped a divergent scale on some conv
+    output) leave the chain un-fused rather than producing a wrong
+    fused add. Most TFLite-imported residual blocks have consistent
+    stamps and chain consts, so the cross-check is a safety net that
+    rarely fires.
   }];
 
   let constructor = "::mlir::timvx::createTIMVXQuantResidualFusePass()";
