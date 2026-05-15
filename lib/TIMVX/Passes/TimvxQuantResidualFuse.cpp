@@ -66,20 +66,36 @@
 // fused on a later iteration get to keep their attrs long enough to
 // be matched.
 //
-// Cross-checks and runtime stamp dependency
-// -----------------------------------------
+// Stamp/chain divergence handling
+// --------------------------------
 // QRF's runtime semantic depends on every operand's `quant.uniform`
 // element-type stamp agreeing with the dequant chain's `mul`/`sub`
 // const operand values. The runtime `timvx.add` reads operand quant
 // from the tensor spec built from the type stamp; the chain const is
-// what the un-fused dequant would multiply through. `matchDequantChain`
-// cross-checks them and SOFT-fails on disagreement, so a tensor whose
-// upstream anchor produced (S, Z) that don't match the chain const
-// (e.g. on a model that legitimately mixes scales) stays un-fused
-// rather than producing a wrong fused add. This cross-check matters
-// for atomic-test correctness but on TFLite-imported resnets is
-// rarely tripped — IREE's TFLite frontend stamps chain consts and
-// rescale-derived (S, Z) consistently with each other.
+// what the un-fused dequant would multiply through.
+//
+// They DISAGREE in one well-defined case: `tosa-quant-anchor` takes
+// its `Sw=1/128` convention path on conv outputs whose TFLite-real
+// `So` isn't recoverable from the local IR. The convention stamps a
+// divergent `S` on the type while the chain const carries the
+// TFLite-real `S`. Empirically this hits the stage-1 residuals on
+// resnet18 (3.4× divergence between stamp `S=0.005` and chain
+// `S=0.0171`). The bytes themselves are still correct for the chain
+// interpretation — the conv-rescale's integer multiplier was set at
+// TOSA time independently of the post-hoc anchor stamp — but the
+// fused `timvx.add` would read the wrong (S, Z) from the operand
+// tensor spec.
+//
+// `matchDequantChain` detects the divergence and sets the out
+// parameter `*needsRelabel`. `matchAndRewrite` then emits a
+// `timvx.cast` (quant→quant byte-copy that just rewrites the output
+// tensor's spec to the new (S, Z)) immediately before the fused add.
+// The cast preserves the byte stream and lets downstream read the
+// chain-real quant context. This unblocks the residuals the older
+// soft-fail-on-mismatch logic refused to fuse — on resnet18, it
+// fuses the remaining 2 stage-1 residuals and drops end-to-end
+// inference from 7.5 ms (2 unfused f32 chains × ~2 ms dispatch tax)
+// to 3.1 ms (8/8 fused).
 //
 // `getI8Operand` case B accepts both `IntegerType` storage and
 // `quant::QuantizedType` wrapping integer storage as the cast
@@ -133,7 +149,8 @@ bool approxEq(double a, double b, double rel = 1e-4, double abs_eps = 1e-6) {
 // dropping the fuse.
 Value matchDequantChain(Operation *contextOp, Value real,
                         double &outScale, int64_t &outZp,
-                        bool *strictFailed) {
+                        bool *strictFailed,
+                        bool *needsRelabel = nullptr) {
   auto mul = real.getDefiningOp<MultiplyOp>();
   if (!mul) return {};
   auto scaleConstF = matchConstScalarFloat(mul.getInput2());
@@ -162,57 +179,52 @@ Value matchDequantChain(Operation *contextOp, Value real,
   if (!isa<IntegerType>(srcElem)) return {};
   if (!dstTy.getElementType().isF32()) return {};
 
-  // Cross-check the chain const against the cast input's RUNTIME quant
-  // — i.e. the (S, Z) the TIM-VX runtime will use to dequantize the
-  // operand inside the fused `timvx.add` we're about to emit.
+  // Chain-const (S, Z) is authoritative for the fused add's per-operand
+  // quant: the un-fused dequant chain explicitly applies the chain
+  // const values to the operand bytes, so the bytes WERE produced by
+  // the upstream conv-rescale in a form consistent with the chain
+  // interpretation (the rescale's integer multiplier+shift was set
+  // accordingly at TOSA time, independent of what scale `tosa-quant-
+  // anchor` later stamped on the tensor type for downstream codegen).
   //
-  // The runtime quant comes from one of two places, in priority:
-  //   1. For a BlockArg, the `timvx.output_scale`/`timvx.output_zp`
-  //      arg-attr (`getProducerQuant`).
-  //   2. For an op-defined value, the `quant.uniform<...>` element type
-  //      stamped by `tosa-quant-anchor` and propagated through
-  //      tosa-to-timvx (read here off `cast.getInput().getType()`).
+  // When the chain's (S, Z) doesn't match the operand's `quant.uniform`
+  // stamp (typical on resnet18 stage-1 residuals — `tosa-quant-anchor`
+  // takes its `Sw=1/128` convention path and writes a divergent S),
+  // the fused `timvx.add`'s runtime reads the WRONG (S, Z) off the
+  // operand TensorSpec and computes a numerically wrong sum. Caller
+  // (`getI8Operand` / `matchAndRewrite`) handles this by inserting a
+  // `timvx.cast` between the operand and the fused add: cast for
+  // quant→quant on this chip is a byte-copy that just relabels the
+  // result tensor with the new (S, Z), so the bytes flow through
+  // unchanged but downstream now reads the chain-real quant context.
   //
-  // BOTH must match the chain const, because once we fuse the chain
-  // away the runtime add reads its operand quant from the operand
-  // tensor's spec (= the type stamp). If `tosa-quant-anchor` derived
-  // S from its Sw=1/128 convention path while TFLite published a
-  // different S in the chain, trusting the chain const after fusing
-  // gives a runtime-time math mismatch — empirically this shifts the
-  // argmax (resnet50 cat105.jpg: 285→852 with cross-check disabled,
-  // i.e. wrong class). Soft-fail and leave the chain unfused so the
-  // explicit mul-by-chain-const continues to do the right math at
-  // runtime. The architectural fix is to make `tosa-quant-anchor`
-  // recover the TFLite-real `So` for these tensors (see the
-  // back-propagation logic in TosaQuantAnchor.cpp).
-  auto checkQuant = [&](double prodS, int64_t prodZ,
-                         const char *prodSrc) -> bool {
-    if (!approxEq(prodS, *scaleConstF)) return false;
-    if (!approxEq(static_cast<double>(prodZ),
-                  static_cast<double>(*zpConstF)))
-      return false;
-    (void)prodSrc;
-    return true;
-  };
+  // `*needsRelabel` (out) is set when the operand's existing stamp
+  // disagrees with the chain const. The matcher itself still succeeds
+  // — relabel is done at emit time.
+  outScale = *scaleConstF;
+  outZp = static_cast<int64_t>(std::lround(*zpConstF));
 
+  bool stampMatchesChain = true;
   if (isa<BlockArgument>(cast.getInput())) {
     if (auto prod = getProducerQuant(cast.getInput())) {
-      if (!checkQuant(prod->first, prod->second, "BlockArg arg-attr"))
-        return {};
+      if (!approxEq(prod->first, *scaleConstF) ||
+          !approxEq(static_cast<double>(prod->second),
+                    static_cast<double>(*zpConstF)))
+        stampMatchesChain = false;
     }
   } else {
     auto castInTy = dyn_cast<RankedTensorType>(cast.getInput().getType());
     if (castInTy) {
       if (auto qt = dyn_cast<quant::UniformQuantizedType>(
               castInTy.getElementType())) {
-        if (!checkQuant(qt.getScale(), qt.getZeroPoint(), "type stamp"))
-          return {};
+        if (!approxEq(qt.getScale(), *scaleConstF) ||
+            !approxEq(static_cast<double>(qt.getZeroPoint()),
+                      static_cast<double>(*zpConstF)))
+          stampMatchesChain = false;
       }
     }
   }
-
-  outScale = *scaleConstF;
-  outZp = static_cast<int64_t>(std::lround(*zpConstF));
+  if (needsRelabel) *needsRelabel = !stampMatchesChain;
   return cast.getInput();
 }
 
@@ -227,9 +239,10 @@ Value matchDequantChain(Operation *contextOp, Value real,
 //       case (B) on the next iteration collapses it.
 Value getI8Operand(Operation *contextOp, Value real,
                     double &outScale, int64_t &outZp,
-                    PatternRewriter &rewriter, bool *strictFailed) {
+                    PatternRewriter &rewriter, bool *strictFailed,
+                    bool *needsRelabel = nullptr) {
   if (Value i8 = matchDequantChain(contextOp, real, outScale, outZp,
-                                    strictFailed))
+                                    strictFailed, needsRelabel))
     return i8;
   // matchDequantChain may have set *strictFailed if it found a partial
   // shape match with a cross-check failure. In that case the IR is
@@ -418,8 +431,9 @@ struct QuantResidualFuse : public OpRewritePattern<CastOp> {
     // fuse candidate. Any operand or type mismatch is inconsistency.
     double Sa = 0, Sb = 0;
     int64_t Za = 0, Zb = 0;
+    bool relabelA = false, relabelB = false;
     Value Ai8 = getI8Operand(finalCast, residualAdd.getInput1(),
-                              Sa, Za, rewriter, strictFailed);
+                              Sa, Za, rewriter, strictFailed, &relabelA);
     if (!Ai8) {
       // Soft fail: an upstream `add` whose operand isn't a quantized
       // i8 source (e.g. a non-residual add fed by a constant or fp32
@@ -430,11 +444,46 @@ struct QuantResidualFuse : public OpRewritePattern<CastOp> {
       return failure();
     }
     Value Bi8 = getI8Operand(finalCast, residualAdd.getInput2(),
-                              Sb, Zb, rewriter, strictFailed);
+                              Sb, Zb, rewriter, strictFailed, &relabelB);
     if (!Bi8) {
       // Same rationale as Ai8 above.
       return failure();
     }
+
+    // Relabel operands whose existing `quant.uniform` stamp diverges
+    // from the chain-derived (S, Z). The fused add's runtime reads
+    // operand quant from the TensorSpec built off the type stamp; if
+    // the stamp carries `tosa-quant-anchor`'s `Sw=1/128` convention
+    // value while the chain const carried the TFLite-real S, the
+    // fused add dequantizes with the wrong scale. Insert a
+    // `timvx.cast` (quant→quant) to relabel: the runtime cast for
+    // quant→quant is a byte-copy that just rewrites the output
+    // tensor's spec to the new (S, Z), so bytes flow through unchanged
+    // and downstream sees the chain-real quant context.
+    Location relabelLoc = finalCast.getLoc();
+    auto relabel = [&](Value v, double s, int64_t z) -> Value {
+      auto vTy = cast<RankedTensorType>(v.getType());
+      auto storage =
+          dyn_cast<quant::QuantizedType>(vTy.getElementType());
+      Type storageElem = storage ? storage.getStorageType()
+                                   : vTy.getElementType();
+      auto newElem = quant::UniformQuantizedType::get(
+          /*flags=*/storage ? storage.getFlags() : 0,
+          /*storageType=*/storageElem,
+          /*expressedType=*/rewriter.getF32Type(),
+          /*scale=*/s, /*zeroPoint=*/z,
+          /*storageTypeMin=*/storage ? storage.getStorageTypeMin()
+                                      : llvm::minIntN(8),
+          /*storageTypeMax=*/storage ? storage.getStorageTypeMax()
+                                      : llvm::maxIntN(8));
+      auto newTy = RankedTensorType::get(vTy.getShape(), newElem);
+      return CastOp::create(rewriter, relabelLoc, newTy, v,
+                             rewriter.getF64FloatAttr(s),
+                             rewriter.getI64IntegerAttr(z))
+          .getResult();
+    };
+    if (relabelA) Ai8 = relabel(Ai8, Sa, Za);
+    if (relabelB) Bi8 = relabel(Bi8, Sb, Zb);
 
     auto aTy = dyn_cast<RankedTensorType>(Ai8.getType());
     auto bTy = dyn_cast<RankedTensorType>(Bi8.getType());
@@ -581,12 +630,25 @@ struct TIMVXQuantResidualFusePass
     // fired, and the 12 identity residuals stayed f32-chained. Separating
     // the phases lets QRF iterate to fixpoint without the strip clobbering
     // unfused-but-still-fuseable casts.
+    //
+    // ITERATION LIMIT: the cascade through a single stage needs one
+    // greedy iteration per residual block in that stage (transition first,
+    // then each identity one block at a time as the upstream bridge cast
+    // appears). The default `maxIterations = 10` is enough for resnet50
+    // (deepest stage = 6 blocks) but fails silently on resnet101 (deepest
+    // stage = 23 blocks) and resnet152 (deepest = 36 blocks): the driver
+    // returns failure when the cap is hit, `signalPassFailure()` is called,
+    // and the pass exits with status 1 without printing a diagnostic.
+    // `kNoLimit` removes the cap; the cascade is naturally bounded by the
+    // residual count (no risk of infinite oscillation — every successful
+    // fuse strictly reduces the f32-add count in the IR).
     {
       RewritePatternSet patterns(&getContext());
       patterns.add<QuantResidualFuse>(&getContext(), &strictFailed);
       GreedyRewriteConfig cfg;
       cfg.enableFolding(false);
       cfg.enableConstantCSE(false);
+      cfg.setMaxIterations(GreedyRewriteConfig::kNoLimit);
       if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
                                           cfg)))
         signalPassFailure();

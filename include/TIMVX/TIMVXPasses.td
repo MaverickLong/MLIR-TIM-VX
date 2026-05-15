@@ -357,16 +357,29 @@ def TIMVXQuantResidualFusePass
     residuals fuse, end-to-end inference reaches ~7.5 ms (matches the
     vendor ACUITY NBG baseline).
 
-    Cross-check: `matchDequantChain` checks the per-operand chain
-    `mul scale_const`/`sub zp_const` against the cast input's
-    `quant.uniform` type stamp and soft-fails on disagreement, so
-    operand stamps that don't match the chain consts (rare on
-    properly-anchored IR, but possible if `tosa-quant-anchor`'s
-    `Sw=1/128` convention path stamped a divergent scale on some conv
-    output) leave the chain un-fused rather than producing a wrong
-    fused add. Most TFLite-imported residual blocks have consistent
-    stamps and chain consts, so the cross-check is a safety net that
-    rarely fires.
+    Stamp/chain divergence handling: when the chain const (S, Z)
+    disagrees with the operand's `quant.uniform` type stamp (happens
+    when `tosa-quant-anchor` took its `Sw=1/128` convention path —
+    typical on resnet18 stage-1 residuals), `matchDequantChain` sets
+    a `needsRelabel` flag instead of soft-failing, and
+    `matchAndRewrite` emits a `timvx.cast` (quant→quant byte-copy
+    that just rewrites the output tensor's spec) immediately before
+    the fused add. The runtime cast for quant→quant ignores (S, Z)
+    and copies bytes, so the byte stream is preserved and downstream
+    reads the chain-real quant context. This unblocks fusion in the
+    divergent-stamp case while keeping byte semantics correct.
+
+    Greedy iteration limit: the cascade through a deep stage requires
+    one greedy iteration per residual block in that stage (transition
+    first, then each identity one block at a time). The default
+    `maxIterations = 10` is enough for resnet50 (deepest stage = 6
+    blocks) but FAILS SILENTLY on resnet101 (deepest = 23) and
+    resnet152 (deepest = 36): `applyPatternsGreedily` returns failure
+    when the cap is hit, `signalPassFailure()` is called, and the pass
+    exits without printing a diagnostic. QRF sets
+    `cfg.setMaxIterations(GreedyRewriteConfig::kNoLimit)` for phase 1
+    — the cascade is bounded by residual count (no oscillation; every
+    successful fuse strictly reduces the f32-add count).
   }];
 
   let constructor = "::mlir::timvx::createTIMVXQuantResidualFusePass()";
