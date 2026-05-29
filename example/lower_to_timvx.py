@@ -58,7 +58,7 @@ def must_exec(path: Path, label: str) -> Path:
 
 def run(cmd):
     print("  $ " + " ".join(str(c) for c in cmd))
-    subprocess.run([str(c) for c in cmd], check=True)
+    subprocess.run([str(c) for c in cmd], check=True, capture_output=True)
 
 
 def resolve_paths(args) -> dict:
@@ -116,10 +116,12 @@ def resolve_paths(args) -> dict:
 # Stages 1–3: lower
 # ----------------------------------------------------------------------------
 
-def lower(p: dict, input_path: Path) -> None:
-    print(f"[1/6] tosa-const-fold + tosa-fold-avgpool-reduce + canonicalize "
-          f"+ tosa-quant-anchor + tosa-to-timvx + timvx-quant-residual-fuse "
-          f"+ canonicalize + timvx-conv1x1-to-fc -> {p['timvx_mlir']}")
+def lower(p: dict, input_path: Path, *,
+          with_fuse: bool = True, with_conv1x1_to_fc: bool = True,
+          with_dequant_fuse: bool = True,
+          with_canonicalize_transpose: bool = True,
+          with_arith_fold: bool = True,
+          with_cse: bool = True) -> None:
     # The WHCN boundary is op-local: each `Conv2DOpConversion` /
     # `MaxPool2DConversion` / `AvgPool2DConversion` / `RescaleConvFusion`
     # emits explicit NHWC<->WHCN `timvx.transpose` pairs around its
@@ -130,24 +132,101 @@ def lower(p: dict, input_path: Path) -> None:
     # quantized i8 tensor type as `!quant.uniform<i8:f32, S:Z>` so the
     # downstream lowerings have a single source of truth instead of
     # rederiving (and possibly disagreeing on) per-tensor scales.
-    # `--timvx-conv1x1-to-fc` runs after the lowering: collapses tflite's
-    # final-classifier 1x1 conv2d into a real FullyConnected (better NN-
-    # engine path than Conv2D on Vivante).
+    # `--timvx-promote-i8-to-u8` rewrites every i8-quantized tensor to its
+    # u8 equivalent (zp += 128, bytes XOR 0x80, ±128 inserted at f32 cast
+    # boundaries) once and for all. After that, every downstream pass
+    # assumes u8 — no scattered "is this an i8 that needs promotion"
+    # checks across `TimvxToEmitC` / `CastConversion` / `Strip*`.
+    # `--timvx-quant-residual-fuse` (toggle via with_fuse): collapses the
+    # `cast→sub→mul→add→clip→mul→add→cast` fp32 dequant detour around
+    # every residual add into a single quantized `timvx.add`. Toggle off
+    # to bisect QRF-introduced regressions against the unfused path.
+    # `--timvx-conv1x1-to-fc` (toggle via with_conv1x1_to_fc): collapses
+    # tflite's final-classifier 1x1 conv2d into a real FullyConnected
+    # (better NN-engine path than Conv2D on Vivante). Toggle off to
+    # keep the conv2d form (e.g. when chasing an FC-specific quirk).
+    # QRF runs BEFORE `--timvx-promote-i8-to-u8`. Reasoning: QRF's
+    # pattern matcher and cross-checks were written for the i8-space
+    # TFLite chain shape (`cast(i8→f32) → sub(zp_i8) → mul(scale)`,
+    # tail `mul(invScale) → add(zp_i8) → cast(f32→i8)`). Once promote
+    # has injected the ±128 byte-shift compensation around every
+    # f32↔u8 cast, the chain shape varies depending on whether the
+    # zp const was uniquely-owned (folded in place) or shared (extra
+    # `add(+128)` op inserted) — and QRF's matcher has no clean way
+    # to discriminate. Running QRF first means it sees the canonical
+    # i8 chain everywhere; promote then handles BOTH the fused
+    # `timvx.add` (just bumps its `output_zp` by +128) AND the
+    # un-fused dequant chains (inserts ±128 compensation as today)
+    # with a single consistent rule.
     cmd = [p["mlir_opt"],
            "--tosa-const-fold", "--tosa-fold-avgpool-reduce",
             "--canonicalize", "--tosa-quant-anchor",
             "--tosa-to-timvx",
-            "--timvx-quant-residual-fuse",
-            # post-fuse canonicalize: DCE the orphaned fp32 dequant
-            # chains that residual-fuse leaves behind once their last
-            # consumer (the original final cast) has been replaced.
-            "--canonicalize",
-            "--timvx-conv1x1-to-fc",
-            input_path, "-o", p["timvx_mlir"]]
+            "--canonicalize"]
+    label = ("tosa-const-fold + tosa-fold-avgpool-reduce + canonicalize + "
+             "tosa-quant-anchor + tosa-to-timvx + canonicalize")
+    if with_fuse:
+        cmd += ["--timvx-quant-residual-fuse", "--canonicalize"]
+        label += " + timvx-quant-residual-fuse + canonicalize"
+    cmd += ["--timvx-promote-i8-to-u8", "--canonicalize"]
+    label += " + timvx-promote-i8-to-u8 + canonicalize"
+    # `--timvx-dequant-fuse`: collapse any per-operand dequant chains
+    # left behind by QRF (or never QRF candidates — e.g. the chain
+    # feeding the global-avg-pool's `reduce_sum`) into single
+    # `timvx.dataconvert` ops. Safe even when --no-fuse: if there are
+    # no chains to fuse, this pass is a no-op.
+    if with_dequant_fuse:
+        cmd += ["--timvx-dequant-fuse", "--canonicalize"]
+        label += " + timvx-dequant-fuse + canonicalize"
+    # `--timvx-canonicalize-transpose`: push the NHWC<->WHCN boundary
+    # transposes that `tosa-to-timvx` sandwiched around each spatial op
+    # upward through see-through elementwise ops (cast / dataconvert /
+    # clip / add / sub / multiply / slice). Pairs that bracket a pure
+    # elementwise chain compose to identity and erase. Run after
+    # promote-i8-to-u8 / QRF / dequant-fuse so the elementwise chain
+    # shape is final (otherwise transposes would block in places those
+    # passes were going to remove). Const operands are physically
+    # permuted at compile time by the existing TransposeOfConstFold
+    # canonicalizer; runtime sees no extra transposes.
+    if with_canonicalize_transpose:
+        cmd += ["--timvx-canonicalize-transpose", "--canonicalize"]
+        label += " + timvx-canonicalize-transpose + canonicalize"
+    # `--timvx-arith-fold`: collapse `sub(sub(x, a), b)` / `add(add(x, a), b)`
+    # / `multiply(multiply(x, a), b)` (and the mixed add/sub forms) into a
+    # single op when both consts are 1-element f32 splats. Targets the head
+    # (`sub(±128) → sub(zp)`) and tail (`add(Zout) → add(-128)`) of every
+    # dequant/requant chain that `timvx-promote-i8-to-u8` leaves behind.
+    if with_arith_fold:
+        cmd += ["--timvx-arith-fold", "--canonicalize"]
+        label += " + timvx-arith-fold + canonicalize"
+    # `--timvx-cse`: structural common-subexpression elimination over pure
+    # timvx ops. The fan-out propagation in `timvx-canonicalize-transpose`
+    # materialises the same upstream `dataconvert` / `add` / `clip` per
+    # downstream consumer; this pass collapses the duplicates back to one
+    # op each. Uses `OperationEquivalence` so the (S, Z) on quant types
+    # gates merging — two consts with identical data but different quant
+    # context stay separate.
+    if with_cse:
+        cmd += ["--timvx-cse"]
+        label += " + timvx-cse"
+    if with_conv1x1_to_fc:
+        cmd += ["--timvx-conv1x1-to-fc"]
+        label += " + timvx-conv1x1-to-fc"
+    cmd += [input_path, "-o", p["timvx_mlir"]]
+    print(f"[1/6] {label} -> {p['timvx_mlir']}")
     run(cmd)
 
+    # `extern-const-dir`: the EmitC pass writes any `timvx.const` whose
+    # numel exceeds `extern-const-threshold` (default 1024) to a
+    # `_timvx_const_<id>.bin` file under this directory, and emits a
+    # `mmap_const(...)` initializer in place of the inline `static const
+    # T[]`. We point it at the same out_dir that holds the runner; the
+    # runtime's default search path is `dirname(/proc/self/exe)`, so the
+    # bins resolve without any env tweaking.
     print(f"[2/6] timvx-to-emitc         -> {p['emitc_mlir']}")
-    run([p["mlir_opt"], "--timvx-to-emitc", p["timvx_mlir"], "-o", p["emitc_mlir"]])
+    run([p["mlir_opt"],
+         f"--timvx-to-emitc=extern-const-dir={p['out_dir']}",
+         p["timvx_mlir"], "-o", p["emitc_mlir"]])
 
     print(f"[3/6] mlir-translate         -> {p['func_cpp']}")
     run([p["mlir_translate"], "--mlir-to-cpp", p["emitc_mlir"], "-o", p["func_cpp"]])
@@ -392,34 +471,21 @@ def parse_input_specs(timvx_mlir_path: Path) -> list[dict]:
         else:
             quant_scale, quant_zp = _find_arg_quant(arg_attrs, body, arg_name)
 
-        # Three cases for an i8 input:
-        #   (1) Asymmetric quant context (zp != 0): promote to UINT8
-        #       with zp+128. The harness/caller is expected to have
-        #       XOR'd the input bytes by 0x80 so the unsigned
-        #       interpretation aligns with the asymmetric int8
-        #       semantics. This matches `shouldPromoteI8AsymToU8` on
-        #       the EmitC side and avoids a runtime auto-DataConvert
-        #       at the IO boundary (which COMPILE_FAILs on this chip).
-        #   (2) Symmetric quant context (zp == 0, scale != 0): keep as
-        #       INT8 but stamp Quant(scale, 0) on the runner tensor.
-        #       Bytes are signed; TIM-VX's cast ops dequantize via the
-        #       quant info, giving real_value = signed_byte * scale.
-        #   (3) No quant context detected (cast-as-first-user, etc.):
-        #       fall back to Quant(1.0, 0). Without this, TIM-VX's
-        #       int->float cast graph fails to compile because the
-        #       node setup requires a Quantization on the int side.
+        # `--timvx-promote-i8-to-u8` has rewritten every quantized i8
+        # tensor (storage type and zp) to its u8 equivalent before the
+        # signature got dumped, so by the time we read the timvx.mlir
+        # signature here every quantized tensor is already u8 with the
+        # +128-shifted zp. We just emit the spec verbatim.
+        # The one residual case we still patch is dtype with no quant
+        # context at all (e.g. a fp32 graph) — TIM-VX's cast op needs a
+        # Quantization on the int side to compile, so we stamp identity
+        # (scale=1.0, zp=0) when scale is unset.
         runner_dtype = DTYPE_TO_VX[dtype_tag]
         runner_scale = quant_scale if dtype_tag in ("i8", "ui8") else 0.0
         runner_zp    = quant_zp    if dtype_tag in ("i8", "ui8") else 0
-        if dtype_tag == "i8":
-            if quant_scale != 0.0 and quant_zp != 0:
-                # asymmetric → promote to UINT8
-                runner_dtype = "UINT8"
-                runner_zp    = quant_zp + 128
-            elif quant_scale == 0.0:
-                # no quant context → identity quant so TIM-VX cast works
-                runner_scale = 1.0
-                runner_zp    = 0
+        if dtype_tag in ("i8", "ui8") and quant_scale == 0.0:
+            runner_scale = 1.0
+            runner_zp    = 0
 
         specs.append({
             "dims": dims,
@@ -550,16 +616,107 @@ def build(p: dict) -> None:
     # is the whole model body as one giant TU and dominates wall time at
     # -O2, so default to -O0 for fast iteration. Override via CXXFLAGS env
     # (e.g. CXXFLAGS="-O2 -g") when you actually want an optimized binary.
-    cxxflags = os.environ.get("CXXFLAGS", "-O0 -pipe").split()
+    cxxflags = os.environ.get("CXXFLAGS", "-O2 -DNDEBUG").split()
 
     # lld links noticeably faster than bfd on this workload; fall back
     # silently if it isn't installed.
     link_extra = ["-fuse-ld=lld"] if shutil.which("ld.lld") else []
 
+    # libjpeg-turbo headers / libs. The Radxa OS image installs the
+    # shared libs at /usr/lib/aarch64-linux-gnu/libjpeg.so* but the dev
+    # headers aren't in the default /usr/include search path — they
+    # live under $REPO_ROOT/ufs/usr/include/ (with jconfig.h in the
+    # aarch64 subdir). The runner's `pipeline/jpeg.h` wraps libjpeg
+    # for the JPEG pre-processor; add the include / lib paths
+    # unconditionally so the runner builds without extra env tweaks.
+    jpeg_include = Path(os.environ.get(
+        "LIBJPEG_INCLUDE", "/home/radxa/ufs/usr/include"))
+    jpeg_lib = Path(os.environ.get(
+        "LIBJPEG_LIB", "/home/radxa/ufs/usr/lib/aarch64-linux-gnu"))
+
+    # OpenCV headers / libs. The CPU JPEG preprocessor uses cv::imdecode
+    # + cv::cvtColor + cv::resize for parity with the vendor's reference
+    # `class_pre.cpp` — same SIMD-optimised decode/resize path. Headers
+    # live under $REPO_ROOT/ufs/usr/include/opencv4 on the Radxa image;
+    # the .so files are alongside libjpeg in the aarch64 lib dir.
+    opencv_include = Path(os.environ.get(
+        "OPENCV_INCLUDE", "/home/radxa/ufs/usr/include/opencv4"))
+
+    # OpenCV's transitive deps (libtbb.so.2 / libwebp.so.6 /
+    # libtiff.so.5 / libIlmImf-2_5.so.25 / …) only exist as old major
+    # versions in `{jpeg_lib}` — newer ones in /usr/lib are
+    # ABI-incompatible. We need the dynamic linker to find those at
+    # runtime. The cleanest way is to rpath `{jpeg_lib}` directly, but
+    # that dir ALSO contains an OLDER libstdc++.so.6 (3.4.28) that
+    # gets picked over the system's newer one (3.4.33) and the binary
+    # fails to load with "GLIBCXX_3.4.29 not found". DT_RUNPATH search
+    # order doesn't help here because libstdc++ then gets resolved via
+    # OpenCV's transitive lookup which considers our rpath. The fix is
+    # a curated shim directory: symlinks to every .so* in `{jpeg_lib}`
+    # EXCEPT libstdc++ / libc / libm / libgcc_s (the runtime libs
+    # that must come from the system). We rpath this shim dir; the
+    # system C++ runtime resolves through /etc/ld.so.cache.
+    opencv_shim = p["script_dir"] / ".build" / "opencv_shim"
+    opencv_shim.mkdir(parents=True, exist_ok=True)
+    # Wipe stale symlinks so we don't accumulate references to files
+    # that may have moved.
+    for old in opencv_shim.iterdir():
+        if old.is_symlink():
+            old.unlink()
+    _SHIM_SKIP_PREFIXES = ("libstdc++.", "libc.", "libc-",
+                            "libm.", "libm-", "libgcc_s.",
+                            "libpthread.", "libdl.", "librt.",
+                            "libresolv.", "ld-")
+    # The OpenCV chain pulls deps from FOUR `$REPO_ROOT/ufs/` lib
+    # dirs (libtbb / libopencv_* in usr/lib/aarch64; libgdal in
+    # usr/lib; libpcre.so.3 in lib/aarch64; etc.). Glob all of them,
+    # first-match-wins on duplicate names so the more specific
+    # aarch64 subdir takes precedence over its parent.
+    _shim_search_dirs = [
+        jpeg_lib,                  # ufs/usr/lib/aarch64-linux-gnu
+        jpeg_lib.parent,           # ufs/usr/lib
+        Path("/home/radxa/ufs/lib/aarch64-linux-gnu"),
+        Path("/home/radxa/ufs/lib"),
+    ]
+    for src_dir in _shim_search_dirs:
+        if not src_dir.is_dir():
+            continue
+        for src in src_dir.glob("*.so*"):
+            if any(src.name.startswith(p) for p in _SHIM_SKIP_PREFIXES):
+                continue
+            link = opencv_shim / src.name
+            if link.exists() or link.is_symlink():
+                continue
+            link.symlink_to(src)
+
     compile_flags = [
-        "-std=c++17", "-fPIC", *cxxflags,
+        "-std=c++17", "-fPIC", "-pthread", *cxxflags,
         f"-I{p['tim_vx_dir']}/include",
+        # TIM-VX internal headers — needed by `pipeline/preproc_rgb_op.h`,
+        # which subclasses `BuiltinOp` to expose OVXLIB's
+        # `VSI_NN_OP_PRE_PROCESS_RGB` op (not in TIM-VX's public C++
+        # surface). `src/tim/vx/` gives us `op_impl.h`, etc.; the inner
+        # `internal/include` is the OVXLIB API (vsi_nn_pub.h chain).
+        f"-I{p['tim_vx_dir']}/src/tim/vx",
+        f"-I{p['tim_vx_dir']}/src/tim/vx/internal/include",
+        # The OVXLIB internal chain transitively pulls `<VX/vx_khr_cnn.h>`
+        # (and friends) — those are part of the Verisilicon driver SDK,
+        # not TIM-VX. Sibling to the driver's `lib/` we already use for
+        # `-L`/rpath; resolve the include dir from the same default.
+        f"-I{viv_sdk_lib_dir.parent}/include",
         f"-I{p['script_dir']}",          # timvx_runtime.h, custom_ops/*.h
+        # `-idirafter` so the libjpeg path is searched ONLY for
+        # otherwise-not-found headers (jpeglib.h, jerror.h, jconfig.h,
+        # jmorecfg.h). Plain `-I` would shadow the system <stdlib.h>
+        # via the dirs's stale glibc fragments — observed: a thicket of
+        # "expected function body after function declarator" errors out
+        # of /usr/include/stdlib.h before we ever hit our code.
+        "-idirafter", str(jpeg_include),
+        "-idirafter", str(jpeg_include / "aarch64-linux-gnu"),
+        # Same idea for the OpenCV headers (they pull in their own
+        # <opencv2/core/cvdef.h> chain — keep them after system
+        # headers so glibc remains canonical).
+        "-idirafter", str(opencv_include),
     ]
 
     runner_obj = p["out_dir"] / "runner_main.o"
@@ -588,14 +745,40 @@ def build(p: dict) -> None:
         sys.exit(f"compile failed (rcs={rcs})")
 
     run([
-        cxx, *cxxflags, *link_extra,
+        cxx, *cxxflags, *link_extra, "-pthread",
         runner_obj, custom_obj, custom_rs_obj,
         f"-L{timvx_lib_dir}",
         f"-L{viv_sdk_lib_dir}",
+        f"-L{jpeg_lib}",
         "-ltim-vx", "-lOpenVX", "-lOpenVXU",
+        # libjpeg is still pulled in by `pipeline/jpeg.h` (used by
+        # the PPU preprocessor + the runner's JPEG-dim probe).
+        # OpenCV's imgcodecs has its own libjpeg link, but keeping
+        # ours explicit is harmless and means the include path stays
+        # resolved.
+        "-ljpeg",
+        # OpenCV: cv::imdecode (imgcodecs), cv::cvtColor + cv::resize
+        # (imgproc), plus cv::Mat (core). All three live in
+        # /home/radxa/ufs/usr/lib/aarch64-linux-gnu/ alongside
+        # libjpeg, so `-L{jpeg_lib}` covers them too.
+        "-lopencv_core", "-lopencv_imgcodecs", "-lopencv_imgproc",
         "-Wl,--unresolved-symbols=ignore-in-shared-libs",
+        # DT_RPATH (the LEGACY, pre-RUNPATH form) on purpose: DT_RPATH
+        # is searched for the binary's DT_NEEDED AND for every
+        # transitively-loaded library's DT_NEEDED too. DT_RUNPATH
+        # only covers the binary's direct deps, which means libtbb /
+        # libwebp / libtiff (loaded by libopencv_core, NOT by us
+        # directly) would fall through to /etc/ld.so.cache and the
+        # ABI-incompatible new majors would get picked.
+        #
+        # The `opencv_shim` dir is curated to NOT contain libstdc++ /
+        # libc / libgcc_s / etc., so lookups for those fall through
+        # past the rpath to /etc/ld.so.cache (system /lib version,
+        # which matches what clang and libtim-vx were built against).
+        "-Wl,--disable-new-dtags",
         f"-Wl,-rpath,{timvx_lib_dir}",
         f"-Wl,-rpath,{viv_sdk_lib_dir}",
+        f"-Wl,-rpath,{opencv_shim}",
         "-o", p["exec_bin"],
     ])
 
@@ -615,25 +798,43 @@ def build(p: dict) -> None:
             "-o", p["compile_nbg_bin"],
         ])
 
-        # NBG runtime binary: VIPLite only — no tim-vx, no OVXLIB. The
-        # SDK lib dir contains libVIPlite.so + libVIPuser.so + headers
-        # under .../inc/. VIPLITE_SDK_DIR overrides the default search.
+        # NBG runtime binary: VIPLite-style API only — no tim-vx, no
+        # OVXLIB. The v1.13 split ships {libVIPlite.so, libVIPuser.so};
+        # v2.0 splits the same API surface across {libNBGlinker.so,
+        # libVIPhal.so} (40 `vip_*` symbols, identical headers modulo a
+        # new BOOL8 enum value). On the A733's newer VIP9000 variant the
+        # kernel's vipcore driver is v2.0-only; v1.13 libs fail at
+        # `vip_init`. We detect by probing the SDK dir for libNBGlinker
+        # and pick link flags accordingly. `VIPLITE_SDK_DIR` overrides.
         viplite_dir = Path(os.environ.get(
             "VIPLITE_SDK_DIR",
             Path.home() / "ufs" / "home" / "radxa" / "ai-sdk" /
-            "viplite-tina" / "lib" / "aarch64-none-linux-gnu" / "v1.13"))
+            "viplite-tina" / "lib" / "aarch64-none-linux-gnu" / "v2.0"))
         viplite_inc = viplite_dir / "inc"
         if not viplite_inc.is_dir():
             sys.exit(
                 f"VIPLITE_SDK_DIR/inc does not exist: {viplite_inc}\n"
-                f"set VIPLITE_SDK_DIR to a viplite-tina/.../v1.13/ directory.")
+                f"set VIPLITE_SDK_DIR to a viplite-tina/.../v{{1.13,2.0}}/ "
+                f"directory.")
+        if (viplite_dir / "libNBGlinker.so").is_file():
+            viplite_link_libs = ["-lNBGlinker", "-lVIPhal"]
+            viplite_version = "v2.0 (NBGlinker + VIPhal)"
+        elif (viplite_dir / "libVIPlite.so").is_file():
+            viplite_link_libs = ["-lVIPlite", "-lVIPuser"]
+            viplite_version = "v1.13 (VIPlite + VIPuser)"
+        else:
+            sys.exit(
+                f"neither libNBGlinker.so nor libVIPlite.so found in "
+                f"{viplite_dir} — point VIPLITE_SDK_DIR at a v1.13 or v2.0 "
+                f"viplite-tina layout.")
+        print(f"  (NBG runtime linking against {viplite_version})")
         run([
             cxx, *cxxflags, *link_extra,
             "-std=c++17",
             f"-I{viplite_inc}",
             p["run_nbg_cpp"],
             f"-L{viplite_dir}",
-            "-lVIPlite", "-lVIPuser",
+            *viplite_link_libs,
             "-Wl,--unresolved-symbols=ignore-in-shared-libs",
             f"-Wl,-rpath,{viplite_dir}",
             "-o", p["run_nbg_bin"],
@@ -663,11 +864,45 @@ def main() -> None:
                     help="With --target=nbg, also run the compile binary "
                          "to materialise <base>.nbg next to the binaries. "
                          "One-time cost; reuse the .nbg afterwards.")
+    # Pipeline knobs — defaults match the production lowering. compare_targets.py
+    # passes --no-fuse to drive the fused/nofuse comparison without re-rolling
+    # the rest of the pipeline.
+    ap.add_argument("--no-fuse", action="store_true",
+                    help="Skip --timvx-quant-residual-fuse (the residual-add "
+                         "QRF fusion). Use to bisect QRF-introduced regressions "
+                         "against the unfused fp32 dequant chain.")
+    ap.add_argument("--no-conv1x1-to-fc", action="store_true",
+                    help="Skip --timvx-conv1x1-to-fc (the 1x1-conv→FC "
+                         "rewrite). Use to keep the conv2d form when chasing "
+                         "an FC-specific kernel quirk.")
+    ap.add_argument("--no-dequant-fuse", action="store_true",
+                    help="Skip --timvx-dequant-fuse (the cast+sub+mul → "
+                         "dataconvert peephole). Use to bisect dequant-fuse-"
+                         "introduced regressions against the explicit "
+                         "cast+sub+mul chain.")
+    ap.add_argument("--no-canonicalize-transpose", action="store_true",
+                    help="Skip --timvx-canonicalize-transpose (pushes "
+                         "boundary transposes upward through elementwise "
+                         "ops until sandwich pairs cancel). Use to bisect "
+                         "transpose-elimination-introduced regressions.")
+    ap.add_argument("--no-arith-fold", action="store_true",
+                    help="Skip --timvx-arith-fold (chained scalar-const "
+                         "add/sub/multiply fold). Use to bisect arith-"
+                         "fold-introduced regressions.")
+    ap.add_argument("--no-cse", action="store_true",
+                    help="Skip --timvx-cse (structural CSE of pure timvx "
+                         "ops). Use to bisect CSE-introduced regressions.")
     args = ap.parse_args()
 
     p = resolve_paths(args)
 
-    lower(p, args.input)
+    lower(p, args.input,
+          with_fuse=not args.no_fuse,
+          with_conv1x1_to_fc=not args.no_conv1x1_to_fc,
+          with_dequant_fuse=not args.no_dequant_fuse,
+          with_canonicalize_transpose=not args.no_canonicalize_transpose,
+          with_arith_fold=not args.no_arith_fold,
+          with_cse=not args.no_cse)
     stage4(p)
     print(f"[5/6] generate runner_main   -> {p['runner_cpp']}")
     render_runner(p)
