@@ -1,3 +1,5 @@
+// Declaration: AI involved in the bug fixing (PPU pre/post) of this file.
+// 
 // pipeline/factory.h — orchestrator+pre/post factory keyed on mode names.
 //
 // Sixteen mode strings, mapping the user's 4-orchestrator × 4-backend

@@ -1,3 +1,5 @@
+// Declaration: AI involved in the bug fixing (PPU pre/post) of this file.
+// 
 // pipeline/postproc.h — `PostProcessor` interface + implementation.
 //
 // A PostProcessor turns the model's output tensor (still on the device
