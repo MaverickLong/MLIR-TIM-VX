@@ -6,6 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 //
+// Declaration: this file is mostly a directly passthrough of timvx dialect
+// so is largely written by AI.
+//
 // Per-op lowerings emit one `emitc.call_opaque` against a runtime helper
 // in `timvx_runtime::`. The helper header is supplied out-of-band;
 // signatures follow the pattern

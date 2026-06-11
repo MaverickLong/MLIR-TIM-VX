@@ -1,3 +1,6 @@
+// Declaration: AI involved in bug fixing for memory layout alignment issue
+// in layoutConvert().
+
 // pipeline/byte_layout.h — byte-layout primitives shared by runner pipeline.
 //
 // Two utilities:

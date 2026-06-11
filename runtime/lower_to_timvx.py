@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""lower_sample.py — drive TOSA → TIM-VX → C++ → executable on one sample.
+"""
+Declaration: This file is largely AI-generated and reviewed by human.
+Specifically, the environment resolution, organisation, and argument generation,
+are AI-generated.
+lower_sample.py — drive TOSA → TIM-VX → C++ → executable on one sample.
 
 Stages:
   1. tosa.mlir       --tosa-const-fold + --tosa-to-timvx-->  <name>.timvx.mlir

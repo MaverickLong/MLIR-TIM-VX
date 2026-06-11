@@ -2,6 +2,12 @@
 
 Lowering Path from MLIR to the TIM-VX backend for VeriSilicon NPUs
 
+## AI Declaration
+
+This repository is AI-assisted, and many files (especially `debug_scripts`) are one-time profiling scripts and are AI-generated.
+
+AI involved mostly in bug fixing and refactoing of code into a integral formatting. AI also writes most of the documents on top of each file and refining the comments in-line.
+
 ## Prerequisites
 
 This repository is only tested on a Allwinner A733 \w Vivante VIP9000 on a Radxa Cubie A7Z. I cannot guarantee the compatibility with other SoCs due to the different subset of operations each NPU supports.

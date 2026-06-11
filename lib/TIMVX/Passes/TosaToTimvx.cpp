@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+// 
+// Declaration: a large proporetion of this file is direct tosa -> timvx
+// dialect passthrough and therefore AI-written.
 //
 // Mapping table (TOSA op  ->  TIM-VX op  ->  tim::vx C++ class):
 //

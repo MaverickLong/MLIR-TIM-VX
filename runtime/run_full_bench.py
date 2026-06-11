@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+Declaration: This file is mostly AI-generated and reviewed by human.
 Comprehensive benchmark suite: orthogonal sweep across
   - Models: resnet{18, 50, 101, 152}
   - Native layout: on/off (input/output transpose folding)

@@ -1,3 +1,6 @@
+// Declaration: This file is largely AI-generated and reviewed by human.
+// This file is largely boilerplate for mapping the EmitC output to the
+// actual TIM-VX backend, and does nothing more than passthrough.
 // timvx_runtime.h — thin one-shot wrappers around tim::vx ops.
 //
 // Each helper does the same four-step dance:

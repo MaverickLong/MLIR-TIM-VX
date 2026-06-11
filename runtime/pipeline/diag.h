@@ -1,3 +1,6 @@
+// Declaration: This is a testing-only file for printing runtime statistics,
+// and is AI-assisted for memory usage monitoring.
+//
 // pipeline/diag.h — small diagnostic helpers used by every run mode:
 //
 //   * `read_file(path)`            — slurp a binary file (or exit on error).

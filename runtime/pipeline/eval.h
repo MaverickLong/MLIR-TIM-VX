@@ -1,3 +1,6 @@
+// Declaration: This is a benchmark-only file that 
+// is AI-generated and reviewed by human.
+// 
 // pipeline/eval.h — `--eval-dir <dir> --labels <file>` plumbing for the
 // runner. One-time ImageNet top-1/top-5 sweep mode.
 //

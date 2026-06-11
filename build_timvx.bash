@@ -1,4 +1,5 @@
 #!/bin/bash
+# Declaration: This file is AI-generated and reviewed by human.
 set -e
 PROJECT_ROOT=$(dirname "$(realpath "$0")")
 

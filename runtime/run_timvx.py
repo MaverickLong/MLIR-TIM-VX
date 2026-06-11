@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""run_sample.py — feed an image into a built timvx runner.
+"""
+Declaration: This file is mostly AI-generated and reviewed by human.
+run_sample.py — feed an image into a built timvx runner.
 
 Pipeline:
   1. decode <image.jpg> -> raw 1*H*W*3 fp32 NHWC bytes (default ImageNet-

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""run_pipeline_bench.py — sweep the runner's 16 orchestration modes on a
+"""
+Declaration: This file is mostly AI-generated and reviewed by human.
+run_pipeline_bench.py — sweep the runner's 16 orchestration modes on a
 JPEG input and print a comparison table.
 
 Usage:

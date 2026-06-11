@@ -1,3 +1,4 @@
+# Declaration: This file is AI-generated and reviewed by human.
 cmake_minimum_required(VERSION 3.20.0)
 project(mlir-timvx LANGUAGES CXX C)
 

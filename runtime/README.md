@@ -1,5 +1,7 @@
-# Example Pipeline
+# MAIP Runtime
 
-This folder contain example python pipeline scripts that I used for testing.
+This folder contain runtime files for the MAIP framework, including C++ runner templates, pre/post processing, and thread-based parallelism code.
 
-They are not production ready, just for simple testing.
+AI wrote the C++ boilerplate that enables benchmarking functionality, and the wiring with the TIM-VX C++ API.
+
+Please refer to independent files for the GenAI declarations.

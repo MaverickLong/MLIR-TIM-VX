@@ -1,3 +1,5 @@
+// Declaration: AI involved in this file by proofreading the TIM-VX
+// source code and providing suggestions on the custom op implementation.
 // pipeline/preproc_rgb_op.h — TIM-VX C++ wrapper around OVXLIB's
 // `VSI_NN_OP_PRE_PROCESS_RGB` op (a single shader-dispatch primitive
 // that fuses resize + per-channel normalize + quantize into one node).

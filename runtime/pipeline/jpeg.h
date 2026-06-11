@@ -1,15 +1,6 @@
 // pipeline/jpeg.h — minimal libjpeg-turbo wrapper that decodes raw JPEG
 // bytes (the file contents) into an RGB888 NHWC buffer + width/height.
-//
-// Why libjpeg-turbo specifically: it's the system JPEG decoder on the
-// Radxa A733 (installed as libjpeg62-turbo). The headers live under
-// `$REPO_ROOT/ufs/usr/include/` rather than `/usr/include/` on this
-// host; the runner build picks them up via the `-I` flags added by
-// `lower_to_timvx.py` (see the `--with-jpeg` block there).
-//
-// We intentionally don't use OpenCV here — its imgcodecs links against
-// many more shared libs and slows the runner's startup; libjpeg alone
-// is enough for the streaming-throughput benchmark.
+// This is relatively stale and used by the PPU path onlt.
 //
 // Decode produces 8-bit-per-channel RGB in row-major (height-by-width
 // rows, channel innermost). The image is stored as

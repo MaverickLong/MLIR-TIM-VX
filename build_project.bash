@@ -1,4 +1,5 @@
 #!/bin/bash
+# Declaration: This file is AI-generated and reviewed by human.
 set -e
 cmake -S . -B build -G Ninja \
   -DMLIR_DIR="$(pwd)/llvm-project/build/lib/cmake/mlir" \

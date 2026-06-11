@@ -1,3 +1,6 @@
+// Declaration: This is a benchmark-only file that is AI-generated
+// and reviewed by human.
+//
 // pipeline/benchmark.h — submit N inputs to an Orchestrator and print
 // throughput + per-stage stats. Used by the `--bench N` runner mode and
 // the implicit one-shot path when `--mode` is selected.

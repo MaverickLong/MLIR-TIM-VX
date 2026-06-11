@@ -1,3 +1,5 @@
+// Declaration: AI involved in the bug fixes and edge case coverage
+// for this file.
 // pipeline/preproc.h — `PreProcessor` interface + implementations.
 //
 // A PreProcessor turns raw input bytes (one image, in whatever encoding
@@ -19,7 +21,7 @@
 //                                  then quantize-to-u8 with the model's
 //                                  (S, Z), then layout-converts.
 //
-//   CpuJpegPreProcessor          : libjpeg decode → resize → normalize
+//   CpuJpegPreProcessor          : OpenCV decode → resize → normalize
 //                                  → quantize → layout convert. All
 //                                  CPU. Default for cpu-* / cpu_zero_copy-*.
 //
@@ -79,7 +81,6 @@
 #include "tim/vx/ops/transpose.h"
 
 #include "pipeline/byte_layout.h"
-#include "pipeline/image.h"
 #include "pipeline/input_spec.h"
 #include "pipeline/iobuffer.h"
 #include "pipeline/jpeg.h"
