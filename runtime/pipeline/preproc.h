@@ -114,7 +114,7 @@ class PreProcessor {
   // Bytes the model's input tensor expects. Caller uses this to
   // sanity-check the produced buffer before CopyDataToTensor.
   virtual size_t expected_output_bytes() const = 0;
-  // Bytes the raw input is expected to be. Used in benchmark/serve mode
+  // Bytes the raw input is expected to be. Used in benchmark / eval modes
   // to size buffer allocations and to validate inputs.
   virtual size_t expected_input_bytes() const = 0;
   // Bytes the preprocessor needs in the per-slot "pre_in" buffer (the
@@ -151,6 +151,11 @@ class CpuPassthroughPreProcessor : public PreProcessor {
     for (auto d : spec.shape) numel_ *= d;
   }
   std::vector<uint8_t> process(const std::vector<uint8_t>& raw) override {
+    // Native (folded-transpose) model: spec.shape is already TIM-VX
+    // innermost-first, so the layout-convert no longer applies — the
+    // caller is expected to hand us bytes already in that order. Pass
+    // through verbatim.
+    if (spec_.timvx_native_layout) return raw;
     std::vector<uint8_t> tvx(raw.size());
     layoutConvert(raw.data(), tvx.data(), spec_.shape, elem_,
                   /*from_mlir_to_tvx=*/true);
@@ -245,11 +250,33 @@ class CpuJpegPreProcessor : public PreProcessor {
   CpuJpegPreProcessor(const InputSpec& spec,
                        std::array<float, 3> mean,
                        std::array<float, 3> std)
-      : spec_(spec), mean_(mean), std_(std) {
+      : spec_(spec), mean_(mean), std_(std),
+        native_(spec.timvx_native_layout) {
     numel_ = 1;
     for (auto d : spec.shape) numel_ *= d;
     elem_ = bytesPerElem(spec.dtype);
-    if (spec.shape.size() == 4) {
+    // Pre-compute vendor-form constants once. Vendor's PRE_PROCESS_RGB
+    // op applies `(x - MEAN) * SCALE` directly on uint8 pixels, where
+    // MEAN = mean*255 and SCALE = 1/(std*255). This is mathematically
+    // equivalent to (x/255 - mean)/std but matches the vendor's float
+    // arithmetic byte-for-byte. With imagenet defaults the constants are
+    // MEAN  = {123.675, 116.28, 103.53}
+    // SCALE = {0.0171247, 0.0175070, 0.0174291}
+    // (verified against the vendor's NBG-baked params: max abs diff
+    // ~1e-7).
+    for (int c = 0; c < 3; ++c) {
+      mean_x255_[c]    = mean_[c] * 255.0f;
+      inv_std_x255_[c] = 1.0f / (std_[c] * 255.0f);
+    }
+    if (native_ && spec.shape.size() == 4) {
+      // `timvx-fold-input-transpose` folded the entry transpose: shape is
+      // already TIM-VX innermost-first WHCN = {W, H, C, N}. We emit the
+      // channel-planar (CHW) byte order this implies directly, no
+      // layout-convert (see process()).
+      dst_w_ = spec.shape[0];
+      dst_h_ = spec.shape[1];
+      layout_nhwc_ = false;  // unused on the native path
+    } else if (spec.shape.size() == 4) {
       // Heuristic: NCHW shape is {N, C, H, W} (C=3), NHWC is {N, H, W, C}.
       // Pick H, W accordingly so resize knows the target.
       if (spec.shape[1] == 3) {
@@ -314,12 +341,33 @@ class CpuJpegPreProcessor : public PreProcessor {
       return static_cast<uint8_t>(static_cast<int8_t>(iq));
     };
 
+    // Native (folded-transpose) path: write WHCN-canonical bytes directly
+    // — channel-planar, W innermost: out[c*H*W + h*W + w]. That IS the
+    // byte order conv2d reads off the input tensor once the entry
+    // transpose is folded into the arg, so there's no layout-convert. The
+    // index is identical to the legacy NCHW branch's `mlir_bytes` index;
+    // we just skip the trailing TIM-VX flip (it would have undone exactly
+    // what the now-gone device transpose used to re-do).
+    if (native_) {
+      const size_t plane = static_cast<size_t>(dst_w_) * dst_h_;
+      for (int c = 0; c < 3; ++c) {
+        for (uint32_t y = 0; y < dst_h_; ++y) {
+          for (uint32_t x = 0; x < dst_w_; ++x) {
+            float n = (static_cast<float>(src[(y * dst_w_ + x) * 3 + c])
+                        - mean_x255_[c]) * inv_std_x255_[c];
+            mlir_bytes[c * plane + y * dst_w_ + x] = quant_byte(n);
+          }
+        }
+      }
+      return mlir_bytes;  // already TIM-VX innermost-first
+    }
+
     if (layout_nhwc_) {
       for (uint32_t y = 0; y < dst_h_; ++y) {
         for (uint32_t x = 0; x < dst_w_; ++x) {
           for (int c = 0; c < 3; ++c) {
-            float rgb = src[(y * dst_w_ + x) * 3 + c] / 255.0f;
-            float n   = (rgb - mean_[c]) / std_[c];
+            float n = (static_cast<float>(src[(y * dst_w_ + x) * 3 + c])
+                        - mean_x255_[c]) * inv_std_x255_[c];
             size_t off = (y * dst_w_ + x) * 3 + c;
             mlir_bytes[off] = quant_byte(n);
           }
@@ -329,8 +377,8 @@ class CpuJpegPreProcessor : public PreProcessor {
       for (int c = 0; c < 3; ++c) {
         for (uint32_t y = 0; y < dst_h_; ++y) {
           for (uint32_t x = 0; x < dst_w_; ++x) {
-            float rgb = src[(y * dst_w_ + x) * 3 + c] / 255.0f;
-            float n   = (rgb - mean_[c]) / std_[c];
+            float n = (static_cast<float>(src[(y * dst_w_ + x) * 3 + c])
+                        - mean_x255_[c]) * inv_std_x255_[c];
             size_t off = ((c * dst_h_) + y) * dst_w_ + x;
             mlir_bytes[off] = quant_byte(n);
           }
@@ -353,9 +401,14 @@ class CpuJpegPreProcessor : public PreProcessor {
  private:
   InputSpec spec_;
   std::array<float, 3> mean_, std_;
+  // Vendor-form constants pre-computed from (mean, std). Used in the
+  // hot normalize loop to apply `(x - MEAN) * SCALE` byte-for-byte
+  // identical to the PPU's PRE_PROCESS_RGB op.
+  std::array<float, 3> mean_x255_{}, inv_std_x255_{};
   size_t numel_, elem_;
   uint32_t dst_h_, dst_w_;
   bool layout_nhwc_;
+  bool native_;  // shape is folded TIM-VX WHCN; emit bytes directly
 };
 
 // ── 4. PPU JPEG pipeline (FULL-PPU: PRE_PROCESS_RGB + Transpose) ────────
@@ -370,11 +423,9 @@ class CpuJpegPreProcessor : public PreProcessor {
 //                 straight to the PPU input without any rearrange.
 //   PPU graph:  PRE_PROCESS_RGB (single shader dispatch that fuses
 //               bilinear resize + per-channel (x-mean)*scale + cast-
-//               to-(S,Z) quantized u8 — the same primitive the vendor
-//               bakes into NBG via `add_preproc_node: true /
-//               preproc_type: IMAGE_RGB`) → Transpose (perm derived
-//               from spec.shape: [3,2,1,0] for NCHW, [3,1,0,2] for
-//               NHWC) which converts the op's channel-planar
+//               to-(S,Z) quantized u8) → Transpose (perm derived from
+//               spec.shape: [3,2,1,0] for NCHW, [3,1,0,2] for NHWC)
+//               which converts the op's channel-planar
 //               `{dst_W, dst_H, 3, 1}` output into the spec.shape-
 //               driven byte layout the NN input tensor expects.
 //
@@ -385,7 +436,7 @@ class CpuJpegPreProcessor : public PreProcessor {
 // Sub({1,1,3,1}) → Multiply({1,1,3,1}) → DataConvert(fp32→u8 q) →
 // Permute — is N dispatches and fp32 traffic through DDR. More
 // importantly, fp32 eltwise against per-channel constants trips a
-// `vivante.nn.tensorcopy` driver bug on this chip (VIP9000Nano-DI):
+// `vivante.nn.tensorcopy` driver bug on this chip (VIP9000):
 // implicit broadcast, explicit Broadcast, AND pre-tiled full-shape
 // constants all hit the same failure. BatchNorm trips `dim 65 exceeds
 // 6`. Falling back to a CPU finish-step (the previous shipping
@@ -445,7 +496,14 @@ class PpuJpegPreProcessor : public PreProcessor {
     numel_ = 1;
     for (auto d : spec.shape) numel_ *= d;
     elem_ = bytesPerElem(spec.dtype);
-    if (spec.shape.size() == 4) {
+    native_ = spec.timvx_native_layout;
+    if (native_ && spec.shape.size() == 4) {
+      // Folded transpose: spec.shape is TIM-VX WHCN {W, H, C, N}. That's
+      // EXACTLY the channel-planar layout PRE_PROCESS_RGB produces, so
+      // the PPU graph needs no trailing Transpose (see build_graph()).
+      dst_w_ = spec.shape[0]; dst_h_ = spec.shape[1];
+      layout_nhwc_ = false;  // unused on the native path
+    } else if (spec.shape.size() == 4) {
       if (spec.shape[1] == 3) {
         layout_nhwc_ = false; dst_h_ = spec.shape[2]; dst_w_ = spec.shape[3];
       } else {
@@ -595,9 +653,8 @@ class PpuJpegPreProcessor : public PreProcessor {
         ? graph_->CreateIOTensor(in_spec, /*data=*/nullptr)
         : graph_->CreateTensor(in_spec);
 
-    // Intermediate: PRE_PROCESS_RGB output, channel-PLANAR
-    // `{dst_W, dst_H, 3, 1}` in the model's quant (so the kernel's
-    // final cast `* (1/Q.s) + Q.zp` lands in NN-ready u8 bytes).
+    // PRE_PROCESS_RGB output quant: the model's input (S, Z) so the
+    // kernel's final cast `* (1/Q.s) + Q.zp` lands in NN-ready u8 bytes.
     Quantization out_quant(spec_.quant_scale != 0.0
                                ? QuantType::ASYMMETRIC
                                : QuantType::NONE,
@@ -605,9 +662,6 @@ class PpuJpegPreProcessor : public PreProcessor {
                                spec_.quant_scale != 0.0 ? spec_.quant_scale
                                                          : 1.0),
                            spec_.quant_zp);
-    auto preproc_out = graph_->CreateTensor(TensorSpec(
-        DataType::UINT8, {dst_w_, dst_h_, 3, 1},
-        TensorAttribute::TRANSIENT, out_quant));
 
     // PRE_PROCESS_RGB params. Mean/scale pre-multiplied for the
     // [0,255] input range (see file header for derivation).
@@ -622,14 +676,39 @@ class PpuJpegPreProcessor : public PreProcessor {
     pp.b_scale = 1.f / (255.f * std_[2]);
     pp.reverse_channel = false;  // cv::cvtColor already gave us RGB.
     auto preproc_op = graph_->CreateOperation<PreProcessRgbOp>(pp);
+
+    if (native_) {
+      // Folded-transpose model: the NN input tensor IS WHCN
+      // `{dst_W, dst_H, 3, 1}` (== spec_.shape), which is precisely the
+      // channel-planar layout PRE_PROCESS_RGB produces. So the op's
+      // output is the graph output directly — no trailing Transpose.
+      // This is the device-side mirror of the host-side layout-convert
+      // we dropped in the CPU preprocessor: both transposes are gone.
+      out_t_ = zerocopy_
+          ? graph_->CreateIOTensor(
+                TensorSpec(DataType::UINT8, {dst_w_, dst_h_, 3, 1},
+                           TensorAttribute::OUTPUT, out_quant),
+                /*data=*/nullptr)
+          : graph_->CreateTensor(
+                TensorSpec(DataType::UINT8, {dst_w_, dst_h_, 3, 1},
+                           TensorAttribute::OUTPUT, out_quant));
+      (*preproc_op).BindInput(in_t_).BindOutput(out_t_);
+      if (!graph_->Compile()) {
+        std::fprintf(stderr, "PpuJpegPreProcessor: graph compile failed\n");
+      }
+      return;
+    }
+
+    // Legacy (non-folded) model: PRE_PROCESS_RGB writes a channel-planar
+    // `{dst_W, dst_H, 3, 1}` intermediate; a Transpose then permutes it
+    // into the NN input's spec.shape byte layout (the NN tensor carries
+    // the MLIR-text shape — NCHW {1,3,224,224} or NHWC {1,224,224,3} —
+    // which TIM-VX reads innermost-first).
+    auto preproc_out = graph_->CreateTensor(TensorSpec(
+        DataType::UINT8, {dst_w_, dst_h_, 3, 1},
+        TensorAttribute::TRANSIENT, out_quant));
     (*preproc_op).BindInput(in_t_).BindOutput(preproc_out);
 
-    // Transpose to the NN input's spec.shape byte layout (see file
-    // header). The NN tensor is created with the MLIR-text shape
-    // (NCHW = {1,3,224,224} or NHWC = {1,224,224,3}); TIM-VX reads
-    // those bytes innermost-first, so we need to permute the
-    // channel-planar `{W,H,3,1}` PPU output into the matching
-    // dimension order.
     std::vector<uint32_t> perm;
     if (layout_nhwc_) {
       // Output shape {1, H, W, 3}. Output dim i = input dim perm[i]:
@@ -665,6 +744,7 @@ class PpuJpegPreProcessor : public PreProcessor {
   size_t numel_, elem_;
   bool layout_nhwc_;
   bool zerocopy_;
+  bool native_;  // folded-transpose model: PPU output IS the NN input
   std::shared_ptr<tim::vx::Context> ctx_;
   std::shared_ptr<tim::vx::Graph> graph_;
   std::shared_ptr<tim::vx::Tensor> in_t_, out_t_;

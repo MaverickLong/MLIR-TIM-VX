@@ -48,7 +48,7 @@
 //     coherence via `Tensor::CopyDataFromTensor(handle_ptr)` (a
 //     self-memcpy that exists for its cache-invalidate side effect —
 //     `InvalidateCacheForHandle()` is documented broken on
-//     VIP9000Nano-DI; see `timvx_zerocopy.cpp`).
+//     VIP9000; see `timvx_zerocopy.cpp`).
 //
 // For the orchestrators that have multiple in-flight Jobs (pipeline,
 // pool, hybrid) we need MULTIPLE buffer triples so that pre worker A
@@ -110,7 +110,7 @@ class IoBufferPool {
   // allocation — CPU zerocopy modes don't need a separate "raw RGB"
   // slot, only PPU pipeline modes do.
   // 64-byte aligned (a typical NPU/DMA alignment requirement; the
-  // exact value isn't documented for VIP9000Nano-DI but matches what
+  // exact value isn't documented for VIP9000 but matches what
   // TIM-VX expects elsewhere).
   IoBufferPool(size_t n_slots, size_t in_bytes, size_t out_bytes,
                size_t pre_in_bytes = 0)

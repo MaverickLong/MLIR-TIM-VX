@@ -70,7 +70,7 @@ using namespace ::mlir::timvx::detail;
 ///
 /// `tim::vx::ops::Clip`'s kernel-selector pattern-matches certain ranges
 /// to specialised activation kernels at compile time. Some of those fast
-/// paths are correct on VIP9000Nano-DI:
+/// paths are correct on VIP9000:
 ///
 ///   * range (0, +inf) -> `relu`     (== max(x, 0))           — OK
 ///   * range (0, 1)    -> `relu1`    (== min(max(x, 0), 1))   — OK

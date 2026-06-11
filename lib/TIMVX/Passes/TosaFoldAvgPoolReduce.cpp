@@ -73,11 +73,30 @@ struct AvgPoolReduceFold : public OpRewritePattern<tosa::CastOp> {
     auto dstTy = dyn_cast<RankedTensorType>(castOp.getType());
     if (!srcTy || !dstTy) return failure();
     if (!srcTy.getElementType().isF32()) return failure();
-    auto outI = dyn_cast<IntegerType>(dstTy.getElementType());
+    // Destination element may be `quant.uniform<iN:fXX, S:Z>` from the
+    // tflite-tagged TOSA upstream; unwrap to the underlying narrow int
+    // for the storage-width check.
+    Type dstElem = dstTy.getElementType();
+    if (auto qty = dyn_cast<quant::QuantizedType>(dstElem))
+      dstElem = qty.getStorageType();
+    auto outI = dyn_cast<IntegerType>(dstElem);
     if (!outI || outI.getWidth() >= 32) return failure();
     auto castScale = castOp->getAttrOfType<FloatAttr>("timvx.output_scale");
     auto castZp = castOp->getAttrOfType<IntegerAttr>("timvx.output_zp");
     if (!castScale || !castZp) return failure();
+    // When the upstream-tagged `quant.uniform` stamp is available on
+    // dstTy, prefer ITS scale over the one `RequantI32SkipFold` recovered
+    // from the inv-scale const. The two agree at fp32 precision but
+    // differ at the 9th significant digit; downstream `tosa-quant-anchor`
+    // rewraps the rebuilt avg_pool2d output using `castScale`, so a drift
+    // between the cast's `output_scale` attr and the original stamp's
+    // scale would cause the wrapping reshape to fail the TOSA same-elem
+    // verifier (input wrapped with the recovered scale, output kept at
+    // the tagged scale).
+    if (auto qty = dyn_cast<quant::UniformQuantizedType>(
+            dstTy.getElementType())) {
+      castScale = rewriter.getF64FloatAttr(qty.getScale());
+    }
 
     auto onlyUseIs = [](Value v, Operation *user) {
       return v.hasOneUse() && *v.getUsers().begin() == user;
@@ -156,13 +175,13 @@ struct AvgPoolReduceFold : public OpRewritePattern<tosa::CastOp> {
     if (kernelH * kernelW != expectedN) return failure();
 
     // Bail on kernels larger than what the chip's NN-engine Pool2d can
-    // actually execute correctly. VIP9000Nano-DI silently produces wrong
+    // actually execute correctly. VIP9000 silently produces wrong
     // values (no Compile error, just garbage output) when the kernel
     // exceeds typical CNN sizes (~32×32). Empirically a 224×224 fold for
     // simple_v1 produced an avg_pool with mean ~0.40 vs CPU's ~-0.05.
     // Refusing the fold here leaves the reduce_sum chain intact so the
     // CustomReduceSum OpenCL kernel under example/custom_ops/ picks it
-    // up via timvx_runtime::reduce_sum (fp32 path on the GC GPU, which
+    // up via timvx_runtime::reduce_sum (fp32 path on the PPU, which
     // does handle arbitrary sizes).
     constexpr int64_t kMaxPoolKernel = 64;
     if (kernelH > kMaxPoolKernel || kernelW > kMaxPoolKernel)
@@ -181,7 +200,12 @@ struct AvgPoolReduceFold : public OpRewritePattern<tosa::CastOp> {
 
     Location loc = castOp.getLoc();
     Type fp32 = rewriter.getF32Type();
-    Type narrowInt = dstTy.getElementType();
+    // The rebuilt cast/avg_pool2d/reshape chain uses plain integer storage
+    // so the per-pixel const inputs (zp const) can be built as plain int.
+    // `castOp`'s users still consume the original `dstTy` (possibly
+    // quant.uniform-wrapped); the final reshape's result type matches
+    // that so the SSA boundary stays type-stable.
+    Type narrowInt = dstElem;
 
     auto splat4D = [&](double v) {
       auto ty = RankedTensorType::get({1, 1, 1, 1}, fp32);
@@ -230,10 +254,20 @@ struct AvgPoolReduceFold : public OpRewritePattern<tosa::CastOp> {
         tosa::shapeType::get(rewriter.getContext(),
                               static_cast<int64_t>(finalShape.size())),
         DenseIntElementsAttr::get(shapeTy, shapeInts));
-    Value reshaped = tosa::ReshapeOp::create(rewriter, loc, finalTy,
+    // Reshape lands on plain integer storage. If the original `castOp`
+    // result type is `quant.uniform<iN:fXX, S:Z>` (tflite-tagged
+    // upstream), append a `tosa.cast` int→quant.uniform to match the
+    // SSA users' expected type. `tosa-quant-anchor`'s strip phase will
+    // peel the quant.uniform off the cast output, leaving a same-width
+    // int→int cast that canonicalize folds away.
+    auto reshapedTy = RankedTensorType::get(finalShape, narrowInt);
+    Value reshaped = tosa::ReshapeOp::create(rewriter, loc, reshapedTy,
                                                pooled, shapeConst);
+    Value finalVal = reshaped;
+    if (finalTy != reshapedTy)
+      finalVal = tosa::CastOp::create(rewriter, loc, finalTy, reshaped);
 
-    rewriter.replaceOp(castOp, reshaped);
+    rewriter.replaceOp(castOp, finalVal);
     return success();
   }
 };

@@ -3,7 +3,7 @@
 //
 //   * `dequantize_output(tensor, &out)` copies the device-side bytes,
 //     layout-flips TIM-VX → MLIR row-major, and dequantizes to f32.
-//     Common between one-shot print, serve top-K, and benchmark runs.
+//     Common between one-shot print and benchmark / eval runs.
 //   * `compute_topk(buf, K)` returns the K largest (idx, value) pairs.
 
 #ifndef TIMVX_PIPELINE_TENSOR_IO_H

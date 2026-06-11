@@ -73,8 +73,17 @@ struct Conv1x1ToFC : public OpRewritePattern<Conv2DOp> {
     Type elemTy = wTy.getElementType();
 
     // [1,1,K,M] -> [K,M] — same memory order, dropping size-1 outer dims.
+    // The dense values attribute is stored with the underlying storage
+    // element type (e.g. `ui8`), not the wrapped `!quant.uniform<...>`
+    // form. `DenseElementsAttr::reshape` asserts on exact element-type
+    // match, so reshape with the storage type first, then re-tag the
+    // const's result with the original (possibly quantized) element type.
+    Type storageElem = elemTy;
+    if (auto qty = dyn_cast<quant::QuantizedType>(elemTy))
+      storageElem = qty.getStorageType();
+    auto reshapeTy = RankedTensorType::get({K, M}, storageElem);
+    auto newWAttr = wAttr.reshape(reshapeTy);
     auto newWTy = RankedTensorType::get({K, M}, elemTy);
-    auto newWAttr = wAttr.reshape(newWTy);
     Value newWeight = ConstOp::create(rewriter, loc, newWTy, newWAttr,
                                        wConst.getQuantScaleAttr(),
                                        wConst.getQuantZpAttr());
@@ -141,7 +150,7 @@ struct Conv1x1ToFC : public OpRewritePattern<Conv2DOp> {
     // which would otherwise become `reshape -> FC -> reshape (rank-
     // restore) -> reshape (the user's)` — back-and-forth shape thrashing
     // that TIM-VX rejects at compile (multiple `RESHAPE2` nodes around
-    // the FC trip graph->Compile on VIP9000Nano-DI on this chip).
+    // the FC trip graph->Compile on VIP9000 on this chip).
     auto userReshape = op->hasOneUse()
         ? dyn_cast<ReshapeOp>(*op->getUsers().begin())
         : ReshapeOp();

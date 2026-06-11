@@ -8,7 +8,7 @@
 //     transpose / conv / pool kernels walk internally).
 //
 // Both are header-only; they're invoked from every PreProcessor /
-// PostProcessor and from the serve and bench loops, so inlining at the
+// PostProcessor and from the bench / eval loops, so inlining at the
 // call site avoids extra TU dependencies.
 //
 // The layout flip exists ONLY at the harness boundary — the MLIR pipeline

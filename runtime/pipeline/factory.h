@@ -13,7 +13,7 @@
 // tensor's bound host buffer (no `CopyDataToTensor` memcpy). See
 // `pipeline/iobuffer.h` and the `infer_one_zerocopy` helper in
 // `pipeline/orchestrator.h` for the cache-coherency dance this
-// requires on VIP9000Nano-DI.
+// requires on VIP9000.
 //
 // The ppu_zero_copy backend is the same idea applied to the PPU
 // pre + NN path: the libjpeg-decoded RGB bytes land in
@@ -86,7 +86,7 @@ struct Backend {
 
 struct ModeConfig {
   std::string mode;      // "cpu-pipeline", "ppu-hybrid", "cpu_zero_copy-pool"...
-  size_t num_pool_workers = 8;     // worker count for pool / hybrid
+  size_t num_pool_workers = 4;     // worker count for pool / hybrid
   size_t queue_cap        = 8;     // for pipeline/hybrid/pool
   // Zerocopy IoBuffer pool size. Has to be large enough that all
   // in-flight Jobs across stages can hold a slot at once. Set

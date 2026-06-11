@@ -9,7 +9,7 @@
 // Collapse the residual-add fp32 detour (`cast(i8->f32) -> sub(zp) ->
 // mul(scale)` ×2 -> `add` -> optional `clip` -> `mul(1/Sout) -> add(Zout)
 // -> cast(f32->i8)`) into a single quantized `timvx.add` carrying
-// (output_scale, output_zp). On VIP9000Nano-DI the NN-core's quant `Add`
+// (output_scale, output_zp). On VIP9000 the NN-core's quant `Add`
 // (probe-matrix u8 <-> u8 <-> u8 PASS) is dramatically cheaper than the
 // CL/EVIS path the f32 chain compiles to. On resnet50 (16 residual
 // blocks), correct cascade-fusing brings end-to-end inference from
@@ -540,7 +540,7 @@ struct QuantResidualFuse : public OpRewritePattern<CastOp> {
     // output tensor's quant context, and a fp32 tensor has none. The
     // runtime's CAST kernel rejects fp32 outputs with ASYM
     // Quantization() ("Inputs/Outputs data type not support: ASYM
-    // UINT8, ASYM FLOAT32" on VIP9000Nano-DI). The numeric conversion
+    // UINT8, ASYM FLOAT32" on VIP9000). The numeric conversion
     // (storage byte → real value) is performed by the kernel using
     // the INPUT tensor's quant context, which the runtime reads off
     // the input spec independently.

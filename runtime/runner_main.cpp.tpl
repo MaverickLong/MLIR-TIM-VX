@@ -25,10 +25,12 @@
 //      mode-name ∈ {cpu-*, cpu_zero_copy-*, ppu-*, ppu_zero_copy-*}
 //                  × {-sequential, -pipeline, -pool, -hybrid}
 //
-//   4. persistent server:
-//        runner --serve <port>
-//      TCP single-input ImageNet-shape server. Wire format and
-//      validation in `pipeline/serve.h`.
+//   4. eval (one-time accuracy sweep):
+//        runner --eval-dir <dir> --labels <file.json>
+//               [--limit <N>] [--passthrough]
+//      Walks the dir of JPEGs (or .bin tensors with --passthrough) and
+//      accumulates top-1 / top-5 against labels[stem]. Hardcoded to
+//      mode=cpu-sequential. Plumbing in `pipeline/eval.h`.
 //
 // All pipeline plumbing lives under `pipeline/` headers. This file only
 // declares the auto-generated `kInputs` and dispatches argv into one of
@@ -53,12 +55,12 @@
 #include "pipeline/benchmark.h"
 #include "pipeline/byte_layout.h"
 #include "pipeline/diag.h"
+#include "pipeline/eval.h"
 #include "pipeline/factory.h"
 #include "pipeline/input_spec.h"
 #include "pipeline/orchestrator.h"
 #include "pipeline/postproc.h"
 #include "pipeline/preproc.h"
-#include "pipeline/serve.h"
 #include "pipeline/tensor_io.h"
 
 namespace tp = timvx_pipeline;
@@ -86,7 +88,8 @@ void usage(const char* argv0) {
   std::fprintf(stderr, "\n");
   std::fprintf(stderr, "  benchmark:   %s --mode <mode> --bench <N> "
                "[--warmup <W>] <image.jpg>\n", argv0);
-  std::fprintf(stderr, "  persistent:  %s --serve <port>\n", argv0);
+  std::fprintf(stderr, "  eval:        %s --eval-dir <dir> --labels <file.json> "
+               "[--limit <N>] [--passthrough]\n", argv0);
   std::fprintf(stderr,
                "  modes:       {cpu,cpu_zero_copy,ppu,ppu_zero_copy}-"
                "{sequential,pipeline,pool,hybrid}\n");
@@ -94,11 +97,16 @@ void usage(const char* argv0) {
 
 // Argument parse → mode + bench iters + warmup + first-input argv index.
 struct ParsedArgs {
-  bool        serve_mode = false;
-  int         serve_port = 0;
   std::string mode;            // empty = no orchestrator (legacy one-shot)
   size_t      bench_iters = 0; // 0 = single-shot
   size_t      warmup_iters = 0;
+  // Eval mode: when eval_dir is non-empty, runner walks the dir, runs each
+  // JPEG through the cpu-sequential orchestrator, accumulates top1/top5
+  // against labels[stem]. Mutually exclusive with --bench / argv input blobs.
+  std::string eval_dir;
+  std::string eval_labels;
+  size_t      eval_limit = 0;  // 0 = no limit
+  bool        eval_passthrough = false;  // .bin files, bypass C++ preproc
   int         input_argv_start = 1;
   bool        ok = false;
 };
@@ -107,13 +115,7 @@ ParsedArgs parse_args(int argc, char** argv) {
   int i = 1;
   while (i < argc) {
     std::string a = argv[i];
-    if (a == "--serve") {
-      if (i + 1 >= argc) return p;
-      p.serve_mode = true;
-      p.serve_port = std::atoi(argv[i + 1]);
-      if (p.serve_port <= 0 || p.serve_port > 65535) return p;
-      i += 2;
-    } else if (a == "--mode") {
+    if (a == "--mode") {
       if (i + 1 >= argc) return p;
       p.mode = argv[i + 1];
       if (!tp::is_valid_mode(p.mode)) {
@@ -130,16 +132,43 @@ ParsedArgs parse_args(int argc, char** argv) {
       if (i + 1 >= argc) return p;
       p.warmup_iters = static_cast<size_t>(std::atoi(argv[i + 1]));
       i += 2;
+    } else if (a == "--eval-dir") {
+      if (i + 1 >= argc) return p;
+      p.eval_dir = argv[i + 1];
+      i += 2;
+    } else if (a == "--labels") {
+      if (i + 1 >= argc) return p;
+      p.eval_labels = argv[i + 1];
+      i += 2;
+    } else if (a == "--limit") {
+      if (i + 1 >= argc) return p;
+      p.eval_limit = static_cast<size_t>(std::atoi(argv[i + 1]));
+      i += 2;
+    } else if (a == "--passthrough") {
+      p.eval_passthrough = true;
+      i += 1;
     } else {
       p.input_argv_start = i;
       break;
     }
   }
-  if (!p.serve_mode) {
-    // The non-serve paths take ONE positional file argument (legacy
-    // multi-input models are still handled by run_legacy_one_shot,
-    // which takes kInputs.size() positional argv blobs). For orchestrated
-    // / bench modes we always have a single input.
+  bool eval_mode = !p.eval_dir.empty();
+  if (eval_mode) {
+    if (p.eval_labels.empty()) {
+      std::fprintf(stderr, "--eval-dir requires --labels\n");
+      return p;
+    }
+    if (!p.mode.empty() || p.bench_iters > 0) {
+      std::fprintf(stderr,
+                   "--eval-dir is mutually exclusive with --mode / --bench "
+                   "(eval is hardcoded to cpu-sequential)\n");
+      return p;
+    }
+  } else {
+    // One positional file argument expected (legacy multi-input models
+    // are still handled by run_legacy_one_shot, which takes kInputs.size()
+    // positional argv blobs). For orchestrated / bench modes we always
+    // have a single input.
     int n_inputs = argc - p.input_argv_start;
     bool legacy_path = p.mode.empty();
     int expected = legacy_path ? static_cast<int>(kInputs.size()) : 1;
@@ -195,9 +224,7 @@ BuiltGraph build_graph(bool use_iotensor) {
   std::printf("[stage] building graph\n"); std::fflush(stdout);
   auto t_build = Clock::now();
   // `inputs` alias for the __INPUT_ARGS__ substitution (which emits
-  // `inputs[0], inputs[1], ...`). The substitution is shared with the
-  // NBG compile binary; keeping the local alias avoids forking a
-  // second template.
+  // `inputs[0], inputs[1], ...`).
   auto& inputs = g.inputs;
   g.output = __FUNC_NAME__(g.graph, __INPUT_ARGS__);
   tp::print_stage("graph built", tp::msSince(t_build));
@@ -224,8 +251,15 @@ int run_legacy_one_shot(BuiltGraph& g, int argc, char** argv, int argv_start) {
   for (size_t i = 0; i < g.inputs.size(); ++i) {
     size_t elem = tp::bytesPerElem(kInputs[i].dtype);
     std::vector<uint8_t> tvx_bytes(input_blobs[i].size());
-    tp::layoutConvert(input_blobs[i].data(), tvx_bytes.data(),
-                      kInputs[i].shape, elem, /*from_mlir_to_tvx=*/true);
+    // Native (folded-transpose) inputs already carry TIM-VX innermost-
+    // first shape, so the blob is expected to be in that byte order
+    // already — skip the MLIR→TIM-VX flip. Legacy inputs get the flip.
+    if (kInputs[i].timvx_native_layout) {
+      tvx_bytes = input_blobs[i];
+    } else {
+      tp::layoutConvert(input_blobs[i].data(), tvx_bytes.data(),
+                        kInputs[i].shape, elem, /*from_mlir_to_tvx=*/true);
+    }
     if (!g.inputs[i]->CopyDataToTensor(
             tvx_bytes.data(),
             static_cast<uint32_t>(tvx_bytes.size()))) {
@@ -408,12 +442,20 @@ int main(int argc, char** argv) {
   // build_graph decides between CreateTensor (copy path) and
   // CreateIOTensor (zerocopy path) for the input tensor based on the
   // chosen orchestration mode — this has to be known BEFORE the graph
-  // body is built so the input tensor's flags are right at compile
-  // time. serve mode never uses zerocopy.
+  // body is built so the input tensor's flags are right at compile time.
   bool use_iotensor = !args.mode.empty() && tp::mode_is_zerocopy(args.mode);
   auto g = build_graph(use_iotensor);
-  if (args.serve_mode) {
-    return tp::run_serve(args.serve_port, g.graph, g.inputs, g.output, kInputs);
+  if (!args.eval_dir.empty()) {
+    // Eval is single-input only; build_graph already produced g.inputs[0]
+    // with the cpu (non-zerocopy) path since args.mode is empty here.
+    if (kInputs.size() != 1) {
+      std::fprintf(stderr, "--eval-dir requires single-input model "
+                            "(have %zu inputs)\n", kInputs.size());
+      return 2;
+    }
+    return tp::run_eval(g.ctx, g.graph, g.inputs[0], g.output, kInputs[0],
+                        args.eval_dir, args.eval_labels, args.eval_limit,
+                        args.eval_passthrough);
   }
   if (!args.mode.empty()) {
     return run_orchestrated(g, args.mode, args.bench_iters,

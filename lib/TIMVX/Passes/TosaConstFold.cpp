@@ -196,12 +196,22 @@ struct PadRescaleSwap : public OpRewritePattern<tosa::RescaleOp> {
     auto unpaddedTy = dyn_cast<RankedTensorType>(pad.getInput1().getType());
     auto paddedDstTy = dyn_cast<RankedTensorType>(resc.getType());
     if (!unpaddedTy || !paddedDstTy) return failure();
-    auto outElemTy = dyn_cast<IntegerType>(paddedDstTy.getElementType());
+    // The element type may be either a plain integer (untagged TOSA) or
+    // a `!quant.uniform<iN:fXX, ...>` (TFLite-tagged TOSA). Use the full
+    // element type when building tensor types so quant info is preserved
+    // for downstream passes, but use the underlying integer storage type
+    // for the pad constant's `DenseIntElementsAttr` (densely typed with
+    // ints, not the quant wrapper).
+    Type fullElemTy = paddedDstTy.getElementType();
+    Type storageElemTy = fullElemTy;
+    if (auto qty = dyn_cast<quant::QuantizedType>(fullElemTy))
+      storageElemTy = qty.getStorageType();
+    auto outElemTy = dyn_cast<IntegerType>(storageElemTy);
     if (!outElemTy) return failure();
 
     Location loc = resc.getLoc();
 
-    auto newRescTy = RankedTensorType::get(unpaddedTy.getShape(), outElemTy);
+    auto newRescTy = RankedTensorType::get(unpaddedTy.getShape(), fullElemTy);
     Value newResc = tosa::RescaleOp::create(
         rewriter, loc, newRescTy, pad.getInput1(), resc.getMultiplier(),
         resc.getShift(), resc.getInputZp(), resc.getOutputZp(),
@@ -233,7 +243,7 @@ struct PadRescaleSwap : public OpRewritePattern<tosa::RescaleOp> {
 //   %c   = tosa.add %b, %z                       : i32
 //   %out = tosa.cast %c   : i32 -> i8 (or u8/i16) : narrow int
 //
-// On VIP9000Nano-DI plain int32 is a near-dead column. The equivalent fp32
+// On VIP9000 plain int32 is a near-dead column. The equivalent fp32
 // form runs end-to-end on supported kernels:
 //
 //   %z_f = tosa.const dense<float(zp_int)>       : f32   (same shape as %z)
@@ -252,7 +262,12 @@ struct RequantI32SkipFold : public OpRewritePattern<tosa::CastOp> {
     auto dstTy = dyn_cast<RankedTensorType>(castOut.getType());
     if (!srcTy || !dstTy) return failure();
     if (!srcTy.getElementType().isInteger(32)) return failure();
-    auto dstInt = dyn_cast<IntegerType>(dstTy.getElementType());
+    // Destination may be a `quant.uniform<iN:fXX, S:Z>` wrapper from the
+    // tflite-tagged TOSA upstream — unwrap to the underlying narrow int.
+    Type dstElem = dstTy.getElementType();
+    if (auto qty = dyn_cast<quant::QuantizedType>(dstElem))
+      dstElem = qty.getStorageType();
+    auto dstInt = dyn_cast<IntegerType>(dstElem);
     if (!dstInt || dstInt.getWidth() >= 32) return failure();
 
     auto add = castOut.getInput().getDefiningOp<tosa::AddOp>();

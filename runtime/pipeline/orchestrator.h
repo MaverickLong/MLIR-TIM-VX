@@ -152,7 +152,7 @@ class BoundedQueue {
 // FlushCacheForHandle()s, Run()s, and CopyDataFromTensors the model
 // output INTO `io_buf->out_data` (which doubles as the cache-
 // invalidate trigger — `InvalidateCacheForHandle()` is broken on
-// VIP9000Nano-DI; see `timvx_zerocopy.cpp`). The postprocessor reads
+// VIP9000; see `timvx_zerocopy.cpp`). The postprocessor reads
 // directly from `io_buf->out_data`. After post is done, the
 // orchestrator releases the io_buf back to its pool.
 struct Job {

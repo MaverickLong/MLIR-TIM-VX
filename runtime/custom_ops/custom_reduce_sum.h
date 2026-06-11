@@ -1,6 +1,6 @@
-// custom_reduce_sum.h — fp32 single-axis reduce_sum on the GC GPU.
+// custom_reduce_sum.h — fp32 single-axis reduce_sum on the PPU.
 //
-// On VIP9000Nano-DI / A733 the NN-engine REDUCE kernel is INT-only —
+// On VIP9000 / A733 the NN-engine REDUCE kernel is INT-only —
 // FP32/FP16/U8 fail at Compile() (op_probe table). For graphs that are
 // still fp32 at the reduce site, we route reduce_sum through this
 // OpenCL kernel rather than tim::vx::ops::ReduceSum.

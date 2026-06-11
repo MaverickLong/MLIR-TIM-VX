@@ -222,7 +222,7 @@ inline TensorPtr fully_connected(GraphPtr graph,
 //
 // Implemented via tim::vx::ops::CustomGemm rather than tim::vx::ops::Matmul:
 // the NN-core Matmul was unreliable in our smoke tests; CustomGemm runs an
-// OpenCL GEMM kernel on the GC GPU, which is FP32-native and works pre-
+// OpenCL GEMM kernel on the PPU, which is FP32-native and works pre-
 // quantization. Caveats inherited from the sample kernel:
 //   - rank-2 only (the kernel reads via image2d_t with 2-D coords),
 //   - FP32 only (the kernel is gemm_F32F32toF32_2D),
@@ -325,10 +325,10 @@ inline TensorPtr slice(GraphPtr graph, TensorPtr input,
 // ReduceSum: tim::vx expects keep_dims explicitly; keep_dims=true keeps
 // the reduced axis as a singleton dim (matches tosa.reduce_sum semantics).
 //
-// FP32 fast path: VIP9000Nano-DI's NN-engine REDUCE only ships INT8/INT32
+// FP32 fast path: VIP9000's NN-engine REDUCE only ships INT8/INT32
 // kernels — fp32/fp16/u8 fail at Compile() (op_probe table). For fp32
 // single-axis keep_dims reductions we route through CustomReduceSum's
-// OpenCL kernel on the GC GPU. The custom path handles any inner stride
+// OpenCL kernel on the PPU. The custom path handles any inner stride
 // (in-memory innermost OR a non-innermost axis like W of an NHWC tensor
 // where C=10 sits inside) as long as `inner * axis_size` fits within the
 // chip's image2d width limit. Anything outside the envelope (multi-axis,
@@ -359,7 +359,7 @@ inline TensorPtr reduce_sum(GraphPtr graph, TensorPtr input,
       outer *= s[i];
   }
 
-  // image2d on this chip's GC GPU caps each dim at 8192 for FP32.
+  // image2d on this chip's PPU caps each dim at 8192 for FP32.
   // Layout A (axis-along-width): input image {inner*axis_size, outer},
   //   limited by inner*axis_size <= W_max.
   // Layout B (axis-along-height): input image {inner, axis_size*outer},
@@ -458,7 +458,7 @@ inline TensorPtr cast(GraphPtr graph, TensorPtr input,
 // (So,Zo) on output_spec. Routes through `tim::vx::ops::DataConvert`
 // (internally vxTensorCopyNode). Used to lower standalone `tosa.rescale`
 // (e.g. the conv→rescale→pad→rescale→pool pattern tflite emits, where the
-// second rescale aligns scales). On VIP9000Nano-DI: int↔int and int→f32
+// second rescale aligns scales). On VIP9000: int↔int and int→f32
 // PASS, f32→int FAILs — keep f32 boundaries on `cast` instead.
 inline TensorPtr dataconvert(GraphPtr graph, TensorPtr input,
                              tim::vx::TensorSpec output_spec) {

@@ -1,6 +1,6 @@
 // pipeline/preproc_rgb_op.h — TIM-VX C++ wrapper around OVXLIB's
-// `VSI_NN_OP_PRE_PROCESS_RGB` op (the same primitive the vendor's
-// `add_preproc_node: true / preproc_type: IMAGE_RGB` bakes into NBG).
+// `VSI_NN_OP_PRE_PROCESS_RGB` op (a single shader-dispatch primitive
+// that fuses resize + per-channel normalize + quantize into one node).
 //
 // Why this exists
 // ---------------

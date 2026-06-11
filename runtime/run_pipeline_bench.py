@@ -84,18 +84,17 @@ def apply_perf_governors() -> bool:
     return ok
 
 
-def wrap_runner_cmd(runner_argv: list[str], pin_cpus: str) -> list[str]:
+def wrap_runner_cmd(runner_argv: list[str], pin_cpus: str | None) -> list[str]:
     """Wrap the runner invocation with `taskset -c <cpus>` if available.
     Otherwise return the bare invocation.
 
     `pin_cpus` is whatever `taskset -c` accepts: a single core ("3"), a
-    range ("0-7"), or a list ("6-7,0"). The default in main() is all
-    cores so pool/hybrid orchestrators can spread across the big.LITTLE
-    layout."""
+    range ("0-7"), or a list ("6-7,0"). When None or empty, no pinning."""
     import shutil
-    if shutil.which("taskset") is None:
-        print("[rt]    taskset not found; running without CPU affinity",
-              file=sys.stderr)
+    if shutil.which("taskset") is None or not pin_cpus:
+        if pin_cpus:
+            print("[rt]    taskset not found; running without CPU affinity",
+                  file=sys.stderr)
         return runner_argv
     print(f"[rt]    pinned to cpus {pin_cpus}", file=sys.stderr)
     return ["taskset", "-c", pin_cpus, *runner_argv]
@@ -144,24 +143,54 @@ _STATS_RE = re.compile(r"\[stats (?P<mode>\S+)\] (?P<kv>.*)")
 _TOPK_RE = re.compile(r"\[topk (?P<mode>\S+)\] (?P<list>.*)")
 
 
-def run_mode(runner: Path, mode: str, image: Path,
-             iters: int, warmup: int, env: dict, timeout: int,
-             pin_cpus: str) -> dict | None:
-    """Execute the runner for one mode; parse [bench]/[topk]/infer lines."""
+def benchmark_runner(runner: Path, mode: str, image: Path,
+                     iters: int, warmup: int, timeout: int,
+                     pin_cpus: str | None = None,
+                     env: dict | None = None,
+                     verbose: bool = True) -> dict | None:
+    """
+    Run a single benchmark mode and return structured results.
+
+    Args:
+        runner: Path to the model runner executable
+        mode: Orchestration mode (e.g., "cpu-sequential", "ppu-pipeline")
+        image: Path to JPEG image input
+        iters: Number of benchmark iterations
+        warmup: Number of warmup iterations
+        timeout: Per-mode timeout in seconds
+        pin_cpus: Optional CPU affinity string (e.g., "0-7" for taskset -c)
+        env: Optional environment dict; defaults to make_env()
+        verbose: Print progress messages to stderr
+
+    Returns:
+        Dict with parsed results (throughput, per_img_ms, infer_mean, infer_p99,
+        e2e_mean, e2e_p99, topk list, etc.) or None on failure.
+        Keys include: mode, n_ok, n_fail, wall_ms, per_img_ms, throughput,
+        infer_mean, infer_se, infer_moe, infer_p99, e2e_mean, e2e_se, e2e_moe,
+        e2e_p99, pre_mean, pre_se, pre_moe, prewait_mean, prewait_se, prewait_moe,
+        postwait_mean, postwait_se, postwait_moe, post_mean, post_se, post_moe, topk
+    """
+    if env is None:
+        repo_root = Path(os.environ.get("REPO_ROOT", runner.parent.parent.parent))
+        env = make_env(repo_root)
+
     base = [str(runner), "--mode", mode,
             "--bench", str(iters), "--warmup", str(warmup), str(image)]
     cmd = wrap_runner_cmd(base, pin_cpus=pin_cpus)
-    print(f"=== running: {' '.join(cmd)}", file=sys.stderr, flush=True)
+    if verbose:
+        print(f"=== running: {' '.join(cmd)}", file=sys.stderr, flush=True)
     try:
         cp = subprocess.run(cmd, env=env, timeout=timeout,
                             capture_output=True, text=True)
     except subprocess.TimeoutExpired:
-        print(f"[timeout] {mode}", file=sys.stderr, flush=True)
+        if verbose:
+            print(f"[timeout] {mode}", file=sys.stderr, flush=True)
         return None
     if cp.returncode != 0:
-        print(f"[rc={cp.returncode}] {mode}\n--- stdout ---\n{cp.stdout}\n"
-              f"--- stderr ---\n{cp.stderr}\n",
-              file=sys.stderr, flush=True)
+        if verbose:
+            print(f"[rc={cp.returncode}] {mode}\n--- stdout ---\n{cp.stdout}\n"
+                  f"--- stderr ---\n{cp.stderr}\n",
+                  file=sys.stderr, flush=True)
         return None
     row = {"mode": mode}
     for line in cp.stdout.splitlines():
@@ -190,6 +219,14 @@ def run_mode(runner: Path, mode: str, image: Path,
     return row
 
 
+def run_mode(runner: Path, mode: str, image: Path,
+             iters: int, warmup: int, env: dict, timeout: int,
+             pin_cpus: str) -> dict | None:
+    """Backward-compatible wrapper for benchmark_runner()."""
+    return benchmark_runner(runner, mode, image, iters, warmup, timeout,
+                           pin_cpus=pin_cpus, env=env, verbose=True)
+
+
 def _parse_mode(mode: str) -> tuple[str, str, str]:
     """`cpu_zero_copy-pipeline` → ('CPU', 'Pipeline', 'Yes'). Unknown
     modes return ('?', '?', '?') so the table at least shows the cell."""
@@ -205,20 +242,38 @@ def _parse_mode(mode: str) -> tuple[str, str, str]:
 def _row_order(rows: list[dict]) -> list[dict]:
     """Order rows for the LaTeX-like table: blocks of 4 parallelism
     strategies grouped by (processor, zerocopy). Matches the user's
-    requested layout (CPU/Yes, CPU/No, PPU/Yes, PPU/No)."""
-    blocks: dict[tuple[str, str], list[dict]] = {}
+    requested layout (CPU/Yes, CPU/No, PPU/Yes, PPU/No).
+
+    When an orthogonal IO-transpose-fuse sweep is present (rows carry
+    `io_fuse`), that's the OUTERMOST grouping — the full fused matrix
+    prints first, then the full unfused matrix — so the two halves line
+    up row-for-row for comparison."""
+    # io_fuse outermost: "Yes" (fused) before "No" (unfused); rows with no
+    # io_fuse tag (single-runner runs) all share one bucket.
+    fuse_buckets: dict[str, list[dict]] = {}
     for r in rows:
-        proc, strat, zc = _parse_mode(r.get("mode", ""))
-        blocks.setdefault((proc, zc), []).append((strat, r))
-    strat_rank = {"Sequential": 0, "Pipeline": 1, "Pool": 2, "Hybrid": 3}
+        fuse_buckets.setdefault(r.get("io_fuse", ""), []).append(r)
+
+    def order_within(bucket: list[dict]) -> list[dict]:
+        blocks: dict[tuple[str, str], list[dict]] = {}
+        for r in bucket:
+            proc, strat, zc = _parse_mode(r.get("mode", ""))
+            blocks.setdefault((proc, zc), []).append((strat, r))
+        strat_rank = {"Sequential": 0, "Pipeline": 1, "Pool": 2, "Hybrid": 3}
+        out: list[dict] = []
+        for key in (("CPU", "Yes"), ("CPU", "No"),
+                    ("PPU", "Yes"), ("PPU", "No")):
+            if key not in blocks:
+                continue
+            for _, r in sorted(blocks[key],
+                                key=lambda sr: strat_rank.get(sr[0], 99)):
+                out.append(r)
+        return out
+
     out: list[dict] = []
-    for key in (("CPU", "Yes"), ("CPU", "No"),
-                ("PPU", "Yes"), ("PPU", "No")):
-        if key not in blocks:
-            continue
-        for _, r in sorted(blocks[key],
-                            key=lambda sr: strat_rank.get(sr[0], 99)):
-            out.append(r)
+    for fuse_key in ("Yes", "No", ""):
+        if fuse_key in fuse_buckets:
+            out.extend(order_within(fuse_buckets[fuse_key]))
     return out
 
 
@@ -249,14 +304,20 @@ def _plain_cell(key: str, fmt: str = "%.3f") -> callable:
     return f
 
 
-def print_table(rows: list[dict]) -> None:
+def print_table(rows: list[dict], with_io_fuse: bool = False) -> None:
     """Emit a LaTeX-like table. Columns match the user's request,
     with the new pre / pre_wait / post_wait / post columns appended at
     the end. Throughput / per-image / NPU mean / e2e and all the new
     columns carry mean $\\pm$ MoE_95% (SE …); the *_p99 columns are
-    raw percentiles (no SE)."""
+    raw percentiles (no SE).
+
+    `with_io_fuse` prepends an "IO Transpose Fuse" column — set when an
+    orthogonal fuse/no-fuse sweep ran (rows carry `io_fuse`)."""
     rows = _row_order([r for r in rows if r])
-    cols = [
+    cols = []
+    if with_io_fuse:
+        cols.append(("IO Fuse", lambda r: r.get("io_fuse", "—")))
+    cols += [
         ("Processor",                lambda r: _parse_mode(r["mode"])[0]),
         ("Parallelism",              lambda r: _parse_mode(r["mode"])[1]),
         ("Zero Copy",                lambda r: _parse_mode(r["mode"])[2]),
@@ -280,10 +341,10 @@ def print_table(rows: list[dict]) -> None:
     print(" " + " & ".join(name for name, _ in cols) + " \\\\")
     print(" \\hline")
 
-    last_block: tuple[str, str] | None = None
+    last_block: tuple[str, str, str] | None = None
     for r in rows:
         proc, strat, zc = _parse_mode(r.get("mode", ""))
-        block = (proc, zc)
+        block = (r.get("io_fuse", ""), proc, zc)
         if last_block is not None and block != last_block:
             print(" \\hline")
         last_block = block
@@ -302,7 +363,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("runner", type=Path,
-                    help="path to the model runner (e.g. lower_out/resnet50_v1/resnet50_v1_runner)")
+                    help="path to the model runner (e.g. lower_out/resnet50_v1/resnet50_v1_runner). "
+                         "This is the FUSED build (default lowering folds the entry NCHW->WHCN "
+                         "transpose and the trailing reshape/transpose tail).")
+    ap.add_argument("--no-fuse-runner", type=Path, default=None,
+                    help="Path to a SECOND runner built with "
+                         "`--no-fold-input-transpose --no-fold-output-transpose`. When given, "
+                         "run_pipeline_bench sweeps the full mode matrix on BOTH runners and "
+                         "prints one table with an orthogonal 'IO Fuse' (Yes/No) axis — so you "
+                         "can read off the perf delta of folding the IO transposes (and eyeball "
+                         "any NPU-recompile numeric drift in the [topk] lines).")
     ap.add_argument("image", type=Path, nargs="?",
                     default=Path(__file__).resolve().parent / "cat105.jpg",
                     help="JPEG file to feed (default: example/cat105.jpg)")
@@ -330,6 +400,15 @@ def main() -> int:
         sys.exit(f"not executable: {args.runner}")
     if not args.image.is_file():
         sys.exit(f"image not found: {args.image}")
+    # Orthogonal IO-transpose-fuse sweep: (runner, io_fuse_label) pairs.
+    # The primary runner is the fused build; --no-fuse-runner adds the
+    # unfused build as a second axis value.
+    sweep = [(args.runner, "Yes")]
+    if args.no_fuse_runner is not None:
+        if (not args.no_fuse_runner.is_file()
+                or not os.access(args.no_fuse_runner, os.X_OK)):
+            sys.exit(f"not executable: {args.no_fuse_runner}")
+        sweep.append((args.no_fuse_runner, "No"))
 
     script_dir = Path(__file__).resolve().parent
     repo_root = Path(os.environ.get("REPO_ROOT", script_dir.parent)).resolve()
@@ -348,15 +427,21 @@ def main() -> int:
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     rows = []
-    for m in modes:
-        row = run_mode(args.runner, m, args.image,
-                       args.iters, args.warmup, env, args.timeout,
-                       args.pin_cpus)
-        if row is None:
-            rows.append({"mode": m})  # placeholder so the table shows the gap
-            continue
-        rows.append(row)
-    print_table(rows)
+    for runner, fuse_label in sweep:
+        if len(sweep) > 1:
+            print(f"[sweep] IO-transpose fuse = {fuse_label}  ({runner})",
+                  file=sys.stderr, flush=True)
+        for m in modes:
+            row = run_mode(runner, m, args.image,
+                           args.iters, args.warmup, env, args.timeout,
+                           args.pin_cpus)
+            if row is None:
+                # placeholder so the table shows the gap
+                rows.append({"mode": m, "io_fuse": fuse_label})
+                continue
+            row["io_fuse"] = fuse_label
+            rows.append(row)
+    print_table(rows, with_io_fuse=(len(sweep) > 1))
     return 0
 
 

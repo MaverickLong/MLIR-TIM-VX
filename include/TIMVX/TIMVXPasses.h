@@ -27,6 +27,8 @@ std::unique_ptr<Pass> createTIMVXPromoteI8ToU8Pass();
 std::unique_ptr<Pass> createTIMVXQuantResidualFusePass();
 std::unique_ptr<Pass> createTIMVXDequantFusePass();
 std::unique_ptr<Pass> createTIMVXCanonicalizeTransposePass();
+std::unique_ptr<Pass> createTIMVXFoldInputTransposePass();
+std::unique_ptr<Pass> createTIMVXFoldOutputTransposePass();
 std::unique_ptr<Pass> createTIMVXArithFoldPass();
 std::unique_ptr<Pass> createTIMVXCsePass();
 std::unique_ptr<Pass> createTIMVXToEmitCPass();

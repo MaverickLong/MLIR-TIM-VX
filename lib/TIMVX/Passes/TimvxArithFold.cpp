@@ -22,7 +22,7 @@
 //
 // The two `sub` ops at the head and the two `add` ops at the tail can
 // each be folded into one op with the constants combined at compile
-// time, eliminating one GC kernel dispatch per chain. Resnet50 has 16
+// time, eliminating one PPU kernel dispatch per chain. Resnet50 has 16
 // residual chains × 2 fold sites per chain = ~32 dispatches saved.
 // Pairs combined:
 //

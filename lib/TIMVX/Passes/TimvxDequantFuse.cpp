@@ -20,11 +20,11 @@
 // `tim::vx::ops::DataConvert` (vxTensorCopyNode) reads the input tensor's
 // (S, Z) at runtime and produces `f32 = (byte - Z) * S` natively — the
 // same math the cast+sub+mul triple does, in one NN-engine kernel
-// dispatch instead of three GC kernel launches.
+// dispatch instead of three PPU kernel launches.
 //
 // What this pass does NOT handle:
 //   * f32 → u8 requant (`mul → add → cast(f32→u8)`): DataConvert
-//     COMPILE_FAILs for f32→int on VIP9000Nano-DI despite the
+//     COMPILE_FAILs for f32→int on VIP9000 despite the
 //     op_check table claiming support. Keep f32→int on `timvx.cast`.
 //     See the comment on TIMVX_DataConvertOp in TIMVXOps.td.
 //   * Residual-add chains: `QuantResidualFuse` already collapses those

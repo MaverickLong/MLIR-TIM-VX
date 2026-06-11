@@ -228,7 +228,7 @@ def TIMVXPromoteI8ToU8Pass : Pass<"timvx-promote-i8-to-u8", "::mlir::ModuleOp"> 
                 "TIM-VX dialect to its u8 equivalent (zp += 128, bytes XOR 0x80).";
 
   let description = [{
-    On VIP9000Nano-DI the runtime auto-promotes every asymmetric int8 IO
+    On VIP9000 the runtime auto-promotes every asymmetric int8 IO
     tensor to `u8|asym(zp+128)` and inserts a `DataConvert` at the
     boundary; that auto-DataConvert COMPILE_FAILs at graph IO for
     non-trivial shapes. Pre-emitting all asym int8 specs as u8 matches
@@ -303,7 +303,7 @@ def TIMVXQuantResidualFusePass
         Sz = add  (Si, Zout)
         OUT = cast f32 → i8 (Sz)      // produces (Sout, Zout)
 
-    On VIP9000Nano-DI every fp32 op runs on the GC GPU's CL/EVIS
+    On VIP9000 every fp32 op runs on the PPU GPU's OpenCL
     kernels at full spatial size — for ResNet50's 16 residuals this
     dominates inference latency (~7× over a fully INT8 path). The
     NN-core's quantized `Add` is a much faster path on the same chip
@@ -403,7 +403,7 @@ def TIMVXDequantFusePass
     `tim::vx::ops::DataConvert` call. DataConvert reads (S, Z) off the
     input tensor's `quant.uniform` element type and produces
     `f32 = (byte − Z) × S` natively in one NN-engine kernel dispatch,
-    instead of three GC kernel launches for cast + sub + mul.
+    instead of three PPU kernel launches for cast + sub + mul.
 
     Pattern matched (the `sub` is omitted when Z == 0 — canonicalize
     folds `sub _, 0.0`):
@@ -427,7 +427,7 @@ def TIMVXDequantFusePass
 
     Does NOT handle the f32→int requant direction
     (`mul → add → cast(f32→u8)`): DataConvert COMPILE_FAILs for
-    f32→int on VIP9000Nano-DI even though `vsi_nn_op_dataconvert.c`'s
+    f32→int on VIP9000 even though `vsi_nn_op_dataconvert.c`'s
     op_check table claims support — see the comment on
     `TIMVX_DataConvertOp` in `TIMVXOps.td`.
 
@@ -521,6 +521,113 @@ def TIMVXCanonicalizeTransposePass
 }
 
 //===----------------------------------------------------------------------===//
+// timvx-fold-input-transpose
+//===----------------------------------------------------------------------===//
+
+def TIMVXFoldInputTransposePass
+    : Pass<"timvx-fold-input-transpose", "::mlir::ModuleOp"> {
+  let summary = "Fold a leading timvx.transpose on a function argument into "
+                "the argument's type, then mark the arg as TIM-VX-native layout.";
+
+  let description = [{
+    `timvx-canonicalize-transpose` collapses every interior transpose of a
+    CNN classifier but leaves exactly one stranded on the entry: the
+    `tosa.transpose %arg0 {0,2,3,1}` (NCHW→NHWC) that lowers to
+    `timvx.transpose %arg0 {perms = 3,2,1,0}` (`1x3x224x224` → `224x224x3x1`,
+    WHCN-canonical). It's stranded because function arguments are a
+    propagation barrier — there's no producer above the arg to push into.
+
+    That transpose is a real per-frame tensor copy on the device. But it
+    only exists to undo the NCHW memory order the runner's preprocessor
+    emits — and the preprocessor's *natural* channel-planar (CHW) output
+    is already the WHCN byte order conv2d wants. So the device transpose
+    and the host's layout-convert are mutually inverse: drop both and the
+    bytes flow straight into the first spatial op.
+
+    This pass does the device half. For every `func.func`, when an entry
+    block argument has exactly one use and that use is a `timvx.transpose`
+    reading the argument directly, it:
+
+      * retypes the argument to the transpose's *result* type (the
+        post-permute WHCN shape — quant `!quant.uniform` element type and
+        all carried verbatim),
+      * RAUWs the transpose result with the argument and erases the
+        transpose,
+      * updates the enclosing `FunctionType`,
+      * stamps `timvx.input_layout = "whcn"` on the argument so the
+        lowering script's `parse_input_specs` can tell the runner to feed
+        raw innermost-first bytes (preprocessor emits CHW directly, no
+        layout-convert) instead of MLIR row-major + flip.
+
+    The host half (preprocessor emitting WHCN directly) is selected off
+    that arg attribute downstream — see `example/pipeline/preproc.h`.
+
+    Multi-use arguments and non-transpose first users are left untouched
+    (no fold, no marker), so a model without the canonical entry transpose
+    lowers exactly as before.
+
+    Run order: `... → timvx-canonicalize-transpose → canonicalize →
+                **timvx-fold-input-transpose** → canonicalize →
+                timvx-conv1x1-to-fc → timvx-to-emitc`.
+  }];
+
+  let constructor = "::mlir::timvx::createTIMVXFoldInputTransposePass()";
+
+  let dependentDialects = [
+      "::mlir::timvx::TIMVXDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// timvx-fold-output-transpose
+//===----------------------------------------------------------------------===//
+
+def TIMVXFoldOutputTransposePass
+    : Pass<"timvx-fold-output-transpose", "::mlir::ModuleOp"> {
+  let summary = "Collapse the trailing byte-preserving reshape/transpose chain "
+                "feeding func.return into the function result type.";
+
+  let description = [{
+    The output mirror of `timvx-fold-input-transpose`. A tflite classifier
+    tail lowers to `fully_connected → reshape → transpose → reshape →
+    transpose → return`, mapping the FC's `{1000,1}` output back to the
+    model's `{1,1000}` row-major result. Every op in that chain only
+    shuffles SIZE-1 dimensions around the single non-unit (class) dim, so
+    the chain is a byte-level identity — the 1000 class values stay
+    contiguous and in the same order throughout. The transposes are still
+    real (if tiny) device dispatches.
+
+    This pass walks backward from each `func.return` operand through
+    single-use producers and drops them while they're byte-preserving:
+
+      * `timvx.reshape` — always (a reshape is a pure metadata change; the
+        innermost-first byte buffer is untouched).
+      * `timvx.transpose` — only when the permutation keeps every non-unit
+        dim in its original relative (innermost→outermost) order, i.e. it
+        merely re-slots size-1 axes. A real spatial transpose
+        (`{3,1,0,2}` etc.) is NOT byte-preserving and halts the walk.
+
+    The surviving value (here the FC output `{1000,1}`) becomes the
+    returned value and the function result type. Top-K / argmax reads the
+    flat 1000-element buffer and is layout-invariant, so the result is
+    bit-identical; only the (now-gone) device transposes differ.
+
+    Stops at the first non-foldable or multi-use producer, so a model whose
+    output genuinely needs a spatial transpose is left untouched.
+
+    Run order: alongside `timvx-fold-input-transpose`, after
+    `timvx-canonicalize-transpose → canonicalize`.
+  }];
+
+  let constructor = "::mlir::timvx::createTIMVXFoldOutputTransposePass()";
+
+  let dependentDialects = [
+      "::mlir::timvx::TIMVXDialect",
+      "::mlir::func::FuncDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // timvx-arith-fold
 //===----------------------------------------------------------------------===//
 
@@ -540,7 +647,7 @@ def TIMVXArithFoldPass
       sub(add(x, a), b) → add(x, a - b)
       multiply(multiply(x, a), b) → multiply(x, a * b)
 
-    Each fold removes a GC kernel dispatch — the ±128 byte-shift
+    Each fold removes a PPU kernel dispatch — the ±128 byte-shift
     compensation `timvx-promote-i8-to-u8` injects around every f32↔u8
     cast leaves the head of each dequant chain as `sub → sub` and the
     tail of every requant chain as `add → add`, and both pairs are

@@ -325,7 +325,7 @@ def TIMVX_MaximumOp : TIMVX_FuncTypeOp<"maximum", [
     into `min(max(x, lo), hi)`. The decomposition deliberately avoids
     `tim::vx::ops::Clip`, whose kernel-selector pattern-matches certain
     finite ranges (`(-1, 1)` -> `relu1`, etc.) to specialised kernels
-    that mis-behave on VIP9000Nano-DI.
+    that mis-behave on VIP9000.
   }];
 
   let arguments = (ins
@@ -478,7 +478,7 @@ def TIMVX_DataConvertOp : TIMVX_FuncTypeOp<"dataconvert", [
     (input scale,zp) → (output scale,zp) projection in storage space, so
     DataConvert is the right tool for int↔int requantize and for the
     int→f32 dequantize boundary. It is NOT the right tool for f32→int —
-    that direction COMPILE_FAILs on VIP9000Nano-DI on this chip even
+    that direction COMPILE_FAILs on VIP9000 on this chip even
     though `vsi_nn_op_dataconvert.c`'s op_check table claims it is
     accepted; use `timvx.cast` for any f32 boundary.
   }];

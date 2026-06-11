@@ -3,8 +3,8 @@
 // generated `kInputs` vector of these (one per function argument), parsed
 // from the timvx MLIR's `func.func` signature by the lowering script.
 //
-// Separated into its own header so PreProcessor / PostProcessor / serve
-// can read the spec without dragging the rest of the runner.
+// Separated into its own header so PreProcessor / PostProcessor can read
+// the spec without dragging the rest of the runner.
 
 #ifndef TIMVX_PIPELINE_INPUT_SPEC_H
 #define TIMVX_PIPELINE_INPUT_SPEC_H
@@ -29,6 +29,15 @@ struct InputSpec {
   // on the spec in that case.
   double  quant_scale = 0.0;
   int32_t quant_zp    = 0;
+  // When true, `shape` is ALREADY in TIM-VX innermost-first order (WHCN
+  // for a 4D input: {W, H, C, N}) because `timvx-fold-input-transpose`
+  // folded the model's entry NCHW→WHCN transpose into the arg type. The
+  // preprocessor must then emit raw innermost-first bytes (channel-planar
+  // CHW for an image) and skip the MLIR-row-major→TIM-VX `layoutConvert`
+  // — that convert plus the (now-gone) device transpose were mutually
+  // inverse. Default false: legacy path, `shape` is MLIR text order and
+  // the preprocessor layout-converts.
+  bool    timvx_native_layout = false;
 };
 
 } // namespace timvx_pipeline

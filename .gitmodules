@@ -7,3 +7,6 @@
 [submodule "Radxa-A733-NPU-Unified-Driver-Support-Package"]
 	path = Radxa-A733-NPU-Unified-Driver-Support-Package
 	url = git@github.com:MaverickLong/Radxa-A733-NPU-Unified-Driver-Support-Package.git
+[submodule "MAIFramework"]
+	path = MAIFramework
+	url = git@github.com:MaverickLong/MAIFramework.git

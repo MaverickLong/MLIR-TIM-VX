@@ -24,7 +24,7 @@
 // canonicalization on, 47 of 57 `timvx.dataconvert` ops are
 // duplicates of an earlier op (e.g. 7 calls of `dataconvert(%277)`),
 // and similar ratios apply to the surrounding `clip` / `add` chain.
-// Each duplicate is a separate kernel dispatch on the NN/GC path; the
+// Each duplicate is a separate kernel dispatch on the NN/PPU path; the
 // per-dispatch tax on OVXLIB is ~1ms regardless of tensor size, so a
 // pure-op duplicate is a pure perf loss.
 //

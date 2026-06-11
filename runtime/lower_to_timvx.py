@@ -94,20 +94,11 @@ def resolve_paths(args) -> dict:
         tim_vx_dir=tim_vx_dir,
         base=base,
         out_dir=out_dir,
-        target=getattr(args, "target", "runner"),
         timvx_mlir=out_dir / f"{base}.timvx.mlir",
         emitc_mlir=out_dir / f"{base}.emitc.mlir",
         func_cpp=out_dir / f"{base}.func.cpp",
         runner_cpp=out_dir / "runner_main.cpp",
         exec_bin=out_dir / f"{base}_runner",
-        # NBG path (only used when target == "nbg"): a builder binary
-        # that calls Graph::CompileToBinary and writes the .nbg blob,
-        # plus a generic VIPLite runner.
-        compile_nbg_cpp=out_dir / "compile_to_nbg.cpp",
-        compile_nbg_bin=out_dir / f"{base}_compile_nbg",
-        run_nbg_cpp=out_dir / "run_nbg.cpp",
-        run_nbg_bin=out_dir / f"{base}_run_nbg",
-        nbg_blob=out_dir / f"{base}.nbg",
         runtime_h=script_dir / "timvx_runtime.h",
     )
 
@@ -120,6 +111,8 @@ def lower(p: dict, input_path: Path, *,
           with_fuse: bool = True, with_conv1x1_to_fc: bool = True,
           with_dequant_fuse: bool = True,
           with_canonicalize_transpose: bool = True,
+          with_fold_input_transpose: bool = True,
+          with_fold_output_transpose: bool = True,
           with_arith_fold: bool = True,
           with_cse: bool = True) -> None:
     # The WHCN boundary is op-local: each `Conv2DOpConversion` /
@@ -191,6 +184,29 @@ def lower(p: dict, input_path: Path, *,
     if with_canonicalize_transpose:
         cmd += ["--timvx-canonicalize-transpose", "--canonicalize"]
         label += " + timvx-canonicalize-transpose + canonicalize"
+    # `--timvx-fold-input-transpose`: retire the one transpose
+    # canonicalize-transpose can't — the entry NCHW→WHCN transpose
+    # stranded on `%arg0` (func args are a propagation barrier). Folds
+    # the permute into the arg's type (`1x3x224x224` → `224x224x3x1`)
+    # and stamps `timvx.input_layout = "whcn"` on the arg. The runner's
+    # preprocessor reads that marker and emits raw WHCN (channel-planar)
+    # bytes directly, so the host-side layout-convert AND this device
+    # transpose both vanish — they were mutually inverse. Runs after
+    # canonicalize-transpose (which leaves the transpose sitting on the
+    # arg) and is a no-op on models without the canonical entry transpose.
+    if with_fold_input_transpose:
+        cmd += ["--timvx-fold-input-transpose", "--canonicalize"]
+        label += " + timvx-fold-input-transpose + canonicalize"
+    # `--timvx-fold-output-transpose`: the output mirror — collapse the
+    # trailing byte-preserving reshape→transpose→reshape→transpose chain
+    # (classifier `{1000,1}` FC output → `{1,1000}` row-major result) into
+    # the func result type. The chain only re-slots size-1 dims, so it's a
+    # byte-level identity and top-K is layout-invariant — bit-identical
+    # result, minus the (tiny) device transpose dispatches. No-op on models
+    # whose output genuinely needs a spatial transpose.
+    if with_fold_output_transpose:
+        cmd += ["--timvx-fold-output-transpose", "--canonicalize"]
+        label += " + timvx-fold-output-transpose + canonicalize"
     # `--timvx-arith-fold`: collapse `sub(sub(x, a), b)` / `add(add(x, a), b)`
     # / `multiply(multiply(x, a), b)` (and the mixed add/sub forms) into a
     # single op when both consts are 1-element f32 splats. Targets the head
@@ -487,11 +503,21 @@ def parse_input_specs(timvx_mlir_path: Path) -> list[dict]:
             runner_scale = 1.0
             runner_zp    = 0
 
+        # `timvx-fold-input-transpose` stamps `timvx.input_layout = "whcn"`
+        # on an arg whose leading NCHW→WHCN transpose it folded into the
+        # type. When present, `dims` are ALREADY TIM-VX innermost-first
+        # (WHCN for 4D), so the runner must feed raw bytes in that order —
+        # the preprocessor emits channel-planar (CHW) directly and skips
+        # the MLIR-row-major→TIM-VX layout-convert.
+        timvx_native = bool(re.search(
+            r'timvx\.input_layout\s*=\s*"whcn"', arg_attrs))
+
         specs.append({
             "dims": dims,
             "dtype": runner_dtype,
             "quant_scale": runner_scale,
             "quant_zp": runner_zp,
+            "timvx_native": timvx_native,
         })
     return specs
 
@@ -515,7 +541,8 @@ def render_runner(p: dict) -> None:
         return (f"    {{{{{', '.join(s['dims'])}}}, "
                 f"tim::vx::DataType::{s['dtype']}, "
                 f"{s.get('quant_scale', 0.0):.10g}, "
-                f"{s.get('quant_zp', 0)}}},")
+                f"{s.get('quant_zp', 0)}, "
+                f"{'true' if s.get('timvx_native') else 'false'}}},")
     input_specs = "\n".join(_fmt(s) for s in specs)
     input_args = ", ".join(f"inputs[{i}]" for i in range(len(specs)))
 
@@ -529,20 +556,6 @@ def render_runner(p: dict) -> None:
 
     render_one(runner_tpl, p["runner_cpp"])
     print(f"  ({len(specs)} non-graph input(s) wired)")
-
-    # NBG target additionally renders compile_to_nbg.cpp and run_nbg.cpp.
-    # run_nbg.cpp.tpl is fully generic (no template subs needed) — it
-    # reads input shapes from the NBG via vip_query_input — but we still
-    # pass it through the substitutor for uniformity.
-    if p.get("target") == "nbg":
-        compile_tpl = p["script_dir"] / "compile_to_nbg.cpp.tpl"
-        run_nbg_tpl = p["script_dir"] / "run_nbg.cpp.tpl"
-        for tpl, dst in ((compile_tpl, p["compile_nbg_cpp"]),
-                          (run_nbg_tpl, p["run_nbg_cpp"])):
-            if not tpl.is_file():
-                sys.exit(f"missing template: {tpl}")
-            render_one(tpl, dst)
-        print(f"  (NBG sources rendered: compile_to_nbg.cpp + run_nbg.cpp)")
 
 
 # ----------------------------------------------------------------------------
@@ -589,7 +602,7 @@ def build(p: dict) -> None:
 
     # OpenVX/OpenVXU come from the Verisilicon driver SDK, NOT TIM-VX itself.
     default_sdk = (Path(os.environ.get("EXTERNAL_VIV_SDK",
-                       Path.home() / "ufs" / "home" / "radxa" / "ai-sdk" /
+                       Path("/") / "home"/ "radxa" / "ufs" / "home" / "radxa" / "ai-sdk" /
                        "unified-tina" / "timvx-sdk")) / "lib")
     viv_sdk_lib_dir = Path(os.environ.get("VIV_SDK_LIB_DIR", default_sdk))
     if not viv_sdk_lib_dir.is_dir():
@@ -722,14 +735,11 @@ def build(p: dict) -> None:
     runner_obj = p["out_dir"] / "runner_main.o"
     custom_obj = p["out_dir"] / "custom_gemm.o"
     custom_rs_obj = p["out_dir"] / "custom_reduce_sum.o"
-    compile_nbg_obj = p["out_dir"] / "compile_to_nbg.o"
 
     # Compile all TUs in parallel — runner_main.cpp (with its #included
     # whole-model func.cpp) is by far the heaviest, but custom_gemm.cc and
     # custom_reduce_sum.cc each cost a few seconds and there's no reason
-    # to serialize them. When --target=nbg, compile_to_nbg.cpp is also a
-    # heavy TU (it #includes the same model body) — fan that out too.
-    target = p.get("target", "runner")
+    # to serialize them.
     print(f"[6/6] {cxx} (parallel compile + link) -> {p['exec_bin']}")
     parallel = [
         _spawn([cxx, *compile_flags, "-c", p["runner_cpp"], "-o", runner_obj]),
@@ -737,9 +747,6 @@ def build(p: dict) -> None:
         _spawn([cxx, *compile_flags, "-c", custom_reduce_sum_cc,
                  "-o", custom_rs_obj]),
     ]
-    if target == "nbg":
-        parallel.append(_spawn([cxx, *compile_flags, "-c",
-                                 p["compile_nbg_cpp"], "-o", compile_nbg_obj]))
     rcs = [pr.wait() for pr in parallel]
     if any(rcs):
         sys.exit(f"compile failed (rcs={rcs})")
@@ -782,64 +789,6 @@ def build(p: dict) -> None:
         "-o", p["exec_bin"],
     ])
 
-    if target == "nbg":
-        # NBG compile binary: same TIM-VX/OVXLIB stack as the runner —
-        # only the entrypoint differs (Graph::CompileToBinary instead
-        # of Graph::Compile + Run).
-        run([
-            cxx, *cxxflags, *link_extra,
-            compile_nbg_obj, custom_obj, custom_rs_obj,
-            f"-L{timvx_lib_dir}",
-            f"-L{viv_sdk_lib_dir}",
-            "-ltim-vx", "-lOpenVX", "-lOpenVXU",
-            "-Wl,--unresolved-symbols=ignore-in-shared-libs",
-            f"-Wl,-rpath,{timvx_lib_dir}",
-            f"-Wl,-rpath,{viv_sdk_lib_dir}",
-            "-o", p["compile_nbg_bin"],
-        ])
-
-        # NBG runtime binary: VIPLite-style API only — no tim-vx, no
-        # OVXLIB. The v1.13 split ships {libVIPlite.so, libVIPuser.so};
-        # v2.0 splits the same API surface across {libNBGlinker.so,
-        # libVIPhal.so} (40 `vip_*` symbols, identical headers modulo a
-        # new BOOL8 enum value). On the A733's newer VIP9000 variant the
-        # kernel's vipcore driver is v2.0-only; v1.13 libs fail at
-        # `vip_init`. We detect by probing the SDK dir for libNBGlinker
-        # and pick link flags accordingly. `VIPLITE_SDK_DIR` overrides.
-        viplite_dir = Path(os.environ.get(
-            "VIPLITE_SDK_DIR",
-            Path.home() / "ufs" / "home" / "radxa" / "ai-sdk" /
-            "viplite-tina" / "lib" / "aarch64-none-linux-gnu" / "v2.0"))
-        viplite_inc = viplite_dir / "inc"
-        if not viplite_inc.is_dir():
-            sys.exit(
-                f"VIPLITE_SDK_DIR/inc does not exist: {viplite_inc}\n"
-                f"set VIPLITE_SDK_DIR to a viplite-tina/.../v{{1.13,2.0}}/ "
-                f"directory.")
-        if (viplite_dir / "libNBGlinker.so").is_file():
-            viplite_link_libs = ["-lNBGlinker", "-lVIPhal"]
-            viplite_version = "v2.0 (NBGlinker + VIPhal)"
-        elif (viplite_dir / "libVIPlite.so").is_file():
-            viplite_link_libs = ["-lVIPlite", "-lVIPuser"]
-            viplite_version = "v1.13 (VIPlite + VIPuser)"
-        else:
-            sys.exit(
-                f"neither libNBGlinker.so nor libVIPlite.so found in "
-                f"{viplite_dir} — point VIPLITE_SDK_DIR at a v1.13 or v2.0 "
-                f"viplite-tina layout.")
-        print(f"  (NBG runtime linking against {viplite_version})")
-        run([
-            cxx, *cxxflags, *link_extra,
-            "-std=c++17",
-            f"-I{viplite_inc}",
-            p["run_nbg_cpp"],
-            f"-L{viplite_dir}",
-            *viplite_link_libs,
-            "-Wl,--unresolved-symbols=ignore-in-shared-libs",
-            f"-Wl,-rpath,{viplite_dir}",
-            "-o", p["run_nbg_bin"],
-        ])
-
 
 # ----------------------------------------------------------------------------
 # Driver
@@ -855,15 +804,6 @@ def main() -> None:
                          "(default: debug_scripts/lower_out/<basename>)")
     ap.add_argument("--skip-build", action="store_true",
                     help="Stop after generating C++; skip clang link step")
-    ap.add_argument("--target", choices=("runner", "nbg"), default="runner",
-                    help="`runner` (default): build the OVXLIB-backed runner. "
-                         "`nbg`: also build a TIM-VX -> NBG compile binary "
-                         "and a VIPLite runtime binary; the latter "
-                         "skips OVXLIB/OpenVX entirely at inference time.")
-    ap.add_argument("--gen-nbg", action="store_true",
-                    help="With --target=nbg, also run the compile binary "
-                         "to materialise <base>.nbg next to the binaries. "
-                         "One-time cost; reuse the .nbg afterwards.")
     # Pipeline knobs — defaults match the production lowering. compare_targets.py
     # passes --no-fuse to drive the fused/nofuse comparison without re-rolling
     # the rest of the pipeline.
@@ -885,6 +825,17 @@ def main() -> None:
                          "boundary transposes upward through elementwise "
                          "ops until sandwich pairs cancel). Use to bisect "
                          "transpose-elimination-introduced regressions.")
+    ap.add_argument("--no-fold-input-transpose", action="store_true",
+                    help="Skip --timvx-fold-input-transpose (folds the entry "
+                         "NCHW→WHCN transpose into %(prog)s's input arg type "
+                         "and marks it whcn-native, so the preprocessor emits "
+                         "WHCN bytes directly). Use to keep the legacy "
+                         "MLIR-row-major input + device transpose.")
+    ap.add_argument("--no-fold-output-transpose", action="store_true",
+                    help="Skip --timvx-fold-output-transpose (collapses the "
+                         "trailing byte-preserving reshape/transpose chain "
+                         "into the func result type). Use to keep the legacy "
+                         "device output transposes.")
     ap.add_argument("--no-arith-fold", action="store_true",
                     help="Skip --timvx-arith-fold (chained scalar-const "
                          "add/sub/multiply fold). Use to bisect arith-"
@@ -901,6 +852,8 @@ def main() -> None:
           with_conv1x1_to_fc=not args.no_conv1x1_to_fc,
           with_dequant_fuse=not args.no_dequant_fuse,
           with_canonicalize_transpose=not args.no_canonicalize_transpose,
+          with_fold_input_transpose=not args.no_fold_input_transpose,
+          with_fold_output_transpose=not args.no_fold_output_transpose,
           with_arith_fold=not args.no_arith_fold,
           with_cse=not args.no_cse)
     stage4(p)
@@ -914,31 +867,6 @@ def main() -> None:
 
     build(p)
 
-    if p.get("target") == "nbg" and args.gen_nbg:
-        # Run the compile binary to materialise the .nbg blob. The
-        # binary's DT_RPATH covers libtim-vx.so and libOpenVX*.so, but
-        # libOpenVX.so transitively dlopens libVSC.so / libGAL.so /
-        # libArchModelSw.so / libNNArchPerf.so by name, and rpath
-        # doesn't propagate. Set LD_LIBRARY_PATH explicitly, mirroring
-        # run_timvx.py.
-        tim_vx_install = Path(os.environ.get(
-            "TIM_VX_BUILD_DIR", p["tim_vx_dir"] / "build" / "install"))
-        timvx_lib_dir = find_timvx_lib_dir(tim_vx_install)
-        default_sdk = (Path(os.environ.get("EXTERNAL_VIV_SDK",
-                            Path.home() / "ufs" / "home" / "radxa" /
-                            "ai-sdk" / "unified-tina" / "timvx-sdk")) / "lib")
-        viv_sdk_lib_dir = Path(os.environ.get("VIV_SDK_LIB_DIR", default_sdk))
-        ld_path = os.pathsep.join(filter(None, [
-            str(timvx_lib_dir),
-            str(viv_sdk_lib_dir),
-            os.environ.get("LD_LIBRARY_PATH", ""),
-        ]))
-        env = {**os.environ, "LD_LIBRARY_PATH": ld_path}
-        print(f"\n[gen-nbg] {p['compile_nbg_bin']} {p['nbg_blob']}")
-        print(f"  LD_LIBRARY_PATH += {timvx_lib_dir}:{viv_sdk_lib_dir}")
-        subprocess.run([str(p["compile_nbg_bin"]), str(p["nbg_blob"])],
-                       env=env, check=True)
-
     print("\ndone. artifacts:")
     print(f"  timvx mlir : {p['timvx_mlir']}")
     print(f"  emitc mlir : {p['emitc_mlir']}")
@@ -946,11 +874,6 @@ def main() -> None:
     print(f"  runtime    : {p['runtime_h']}")
     print(f"  runner     : {p['runner_cpp']}")
     print(f"  executable : {p['exec_bin']}")
-    if p.get("target") == "nbg":
-        print(f"  nbg compile: {p['compile_nbg_bin']}")
-        print(f"  nbg runtime: {p['run_nbg_bin']}")
-        if args.gen_nbg:
-            print(f"  nbg blob   : {p['nbg_blob']}")
 
 
 if __name__ == "__main__":

@@ -160,6 +160,78 @@ struct TosaQuantAnchorPass
       if (qz.find(v) == qz.end()) qz[v] = rec;
     };
 
+    // (a0) "Calibrated TOSA" path: tensors whose element type is already
+    // a `!quant.uniform<iN:fXX, S:Z>` carry the authoritative TFLite
+    // calibration. Harvest (S, Z) directly from those types and strip the
+    // quant wrapper back to plain int storage so every downstream
+    // pattern (PadRescaleSwap, QRF, RequantI32SkipFold, …) keeps its
+    // existing `dyn_cast<IntegerType>` element-type checks.
+    //
+    // (Why strip vs. let everyone read types: every pattern currently
+    // matches plain-int TOSA shapes — refactoring them all is a flag day.
+    // This single import-and-strip step preserves the calibration without
+    // forcing that. Long-term, patterns can migrate to reading types
+    // directly and this step + `qz` become vestigial.)
+    // Strip-and-restore: harvest (S, Z), then rewrite the tensor type to
+    // the plain integer storage form. The existing `rewriteTypes` step at
+    // the end of this pass will re-stamp `!quant.uniform<iN:fXX, S:Z>`
+    // using these authoritative values. Between import and re-stamp,
+    // every downstream pattern (PadRescaleSwap, RequantI32SkipFold, …
+    // and tosa-to-timvx / QRF after this pass) sees plain int element
+    // types and keeps its existing matchers working unchanged.
+    //
+    // Const handling: the TFLite-tagged TOSA emits `tosa.const` with the
+    // VALUES attribute already in plain-int storage form (e.g.
+    // `dense<bytes> : tensor<7x7x3x64xi8>`) while the RESULT type wraps
+    // it in `quant.uniform`. setType on the result to the plain-int form
+    // therefore restores symmetry without rebuilding the values attr.
+    // importAndStrip:
+    //   * For every value whose element type is quant.uniform, record the
+    //     calibrated (S, Z) into qz with userExplicit=true.
+    //   * For non-const values, strip the wrapper to plain int storage so
+    //     downstream patterns (tosa-to-timvx / QRF / RequantI32SkipFold)
+    //     keep their existing `dyn_cast<IntegerType>` element-type checks.
+    //   * For tosa.const results, leave the type alone — keeping the
+    //     wrapper means rewriteTypes' setType+bitcast path runs into
+    //     `DenseElementsAttr::bitcast(QuantizedType)` which is UNREACHABLE
+    //     in MLIR's attribute storage. RescaleConvFusion re-derives the
+    //     weight scale `sw = M × So / Si` from the (calibrated) qz values
+    //     and stamps a fresh timvx.const with quant_scale/quant_zp attrs,
+    //     so const-wrapper preservation isn't load-bearing for emission.
+    auto importAndStrip = [&](Value v, bool isConst) {
+      auto rt = dyn_cast<RankedTensorType>(v.getType());
+      if (!rt) return;
+      auto qty = dyn_cast<quant::UniformQuantizedType>(rt.getElementType());
+      if (!qty) return;
+      qz[v] = {qty.getScale(), qty.getZeroPoint(),
+                /*fromConvention=*/false, /*userExplicit=*/true};
+      if (isConst) return;
+      auto stripped = RankedTensorType::get(rt.getShape(),
+                                              qty.getStorageType());
+      v.setType(stripped);
+    };
+    for (BlockArgument a : f.getArguments())
+      importAndStrip(a, /*isConst=*/false);
+    f.walk([&](Operation *op) {
+      bool isConst = isa<tosa::ConstOp>(op);
+      for (Value r : op->getResults()) importAndStrip(r, isConst);
+    });
+    // Patch the func signature now that BlockArg / return types may have
+    // changed under us.
+    {
+      SmallVector<Type> newIns(f.getArgumentTypes());
+      for (auto en : llvm::enumerate(f.getArguments()))
+        newIns[en.index()] = en.value().getType();
+      SmallVector<Type> newOuts(f.getResultTypes());
+      f.walk([&](func::ReturnOp ret) {
+        for (auto en : llvm::enumerate(ret.getOperands()))
+          newOuts[en.index()] = en.value().getType();
+      });
+      auto newFnTy = FunctionType::get(ctx, newIns, newOuts);
+      if (newFnTy != f.getFunctionType())
+        f.setType(newFnTy);
+    }
+
     // (a) BlockArgs. Track whether (S, Z) came from an EXPLICIT
     // arg-attr declaration vs. the default (1.0, 0) convention anchor
     // — back-propagation later overrides the convention silently but
@@ -178,6 +250,8 @@ struct TosaQuantAnchorPass
         z = za.getInt();
         explicitArg = true;
       }
+      // If (a0) already populated qz from a quant.uniform type, keep it.
+      if (qz.find(a) != qz.end()) continue;
       qz[a] = {s, z, /*fromConvention=*/!explicitArg,
                 /*userExplicit=*/explicitArg};
     }
@@ -491,27 +565,19 @@ struct TosaQuantAnchorPass
       const QZ &rec = kv.second;
       auto rt = dyn_cast<RankedTensorType>(v.getType());
       if (!rt) continue;
-      // Already a quant.uniform — skip (idempotent).
+      // Already a quant.uniform — skip (idempotent). Also skip tosa.const
+      // results: `DenseElementsAttr::bitcast` to a `quant::QuantizedType`
+      // hits an UNREACHABLE in MLIR's attribute-storage layer, and
+      // downstream emission (RescaleConvFusion) re-derives Sw and
+      // stamps timvx.const{quant_scale,quant_zp} from qz directly, so
+      // the const result type doesn't need to carry the wrapper.
       if (isa<quant::UniformQuantizedType>(rt.getElementType())) continue;
+      if (auto def = v.getDefiningOp()) {
+        if (isa<tosa::ConstOp>(def)) continue;
+      }
       auto qty = qtyOf(rec.scale, rec.zp);
       auto newRT = RankedTensorType::get(rt.getShape(), qty);
       v.setType(newRT);
-
-      // For `tosa.const` results, the verifier checks that the `values`
-      // attribute's type matches the result type. The dense storage
-      // bytes stay identical (both i8); we just need to re-tag the
-      // attribute with the new tensor type.
-      if (auto def = v.getDefiningOp()) {
-        if (auto c = dyn_cast<tosa::ConstOp>(def)) {
-          if (c.getResult() == v) {
-            auto oldVals = dyn_cast<DenseElementsAttr>(c.getValuesAttr());
-            if (oldVals) {
-              auto newVals = oldVals.bitcast(qty);
-              c.setValuesAttr(newVals);
-            }
-          }
-        }
-      }
     }
 
     // If any BlockArg got rewritten, the function signature must match.

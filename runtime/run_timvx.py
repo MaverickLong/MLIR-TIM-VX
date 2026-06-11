@@ -262,62 +262,22 @@ def main() -> int:
         if args.keep:
             print(f"input bin (kept): {input_bin}", file=sys.stderr)
 
-        # NBG runners (built by --target=nbg, suffix _run_nbg) take a
-        # different invocation: `runner <model.nbg> <input.bin>` instead of
-        # `runner <input.bin>`. They also link against VIPLite, not TIM-VX/
-        # OVXLIB, so LD_LIBRARY_PATH points at the viplite-tina SDK dir
-        # rather than the TIM-VX install + Verisilicon driver bundle. The
-        # .nbg blob lives next to the binary as `<base>.nbg`.
-        is_nbg = args.runner.name.endswith("_run_nbg")
-        if is_nbg:
-            base = args.runner.name[: -len("_run_nbg")]
-            nbg_blob = args.runner.parent / f"{base}.nbg"
-            if not nbg_blob.is_file():
-                sys.exit(f"NBG runner expects {nbg_blob} next to the binary "
-                         f"(missing — re-run lower_to_timvx.py with "
-                         f"--target=nbg --gen-nbg).")
-            viplite_dir = Path(os.environ.get(
-                "VIPLITE_SDK_DIR",
-                Path.home() / "ufs" / "home" / "radxa" /
-                "ai-sdk" / "viplite-tina" / "lib" /
-                "aarch64-none-linux-gnu" / "v2.0"))
-            # v1.13 ships {libVIPlite, libVIPuser}; v2.0 ships
-            # {libNBGlinker, libVIPhal}. The vipcore kernel driver on
-            # the A733's newer VIP9000 variant only speaks v2.0 — v1.13
-            # libs fail at vip_init. The runner binary's rpath references
-            # one set or the other (set at build time); we just need to
-            # have those .so's findable at runtime, hence the LD path.
-            if not ((viplite_dir / "libNBGlinker.so").is_file() or
-                    (viplite_dir / "libVIPlite.so").is_file()):
-                sys.exit(f"VIPLite libs not found under {viplite_dir}; set "
-                         f"VIPLITE_SDK_DIR to a v1.13 (libVIPlite/libVIPuser) "
-                         f"or v2.0 (libNBGlinker/libVIPhal) layout.")
-            ld_path = os.pathsep.join(filter(None, [
-                str(viplite_dir),
-                os.environ.get("LD_LIBRARY_PATH", ""),
-            ]))
-            env = {**os.environ, "LD_LIBRARY_PATH": ld_path}
-            cmd = [str(args.runner), str(nbg_blob), str(input_bin)]
-        else:
-            ld_path = os.pathsep.join(filter(None, [
-                str(timvx_lib_dir),
-                str(viv_sdk_lib_dir),
-                os.environ.get("LD_LIBRARY_PATH", ""),
-            ]))
-            env = {**os.environ,
-                   "LD_LIBRARY_PATH": ld_path,
-                   "VIVANTE_SDK_DIR": str(viv_shim),
-                   "VSI_NN_LOG_LEVEL": str(5)}
-            cmd = [str(args.runner), str(input_bin)]
+        ld_path = os.pathsep.join(filter(None, [
+            str(timvx_lib_dir),
+            str(viv_sdk_lib_dir),
+            os.environ.get("LD_LIBRARY_PATH", ""),
+        ]))
+        env = {**os.environ,
+               "LD_LIBRARY_PATH": ld_path,
+               "VIVANTE_SDK_DIR": str(viv_shim),
+               "VSI_NN_LOG_LEVEL": str(5)}
+        cmd = [str(args.runner), str(input_bin)]
 
         print("---", file=sys.stderr)
         print(f"running {' '.join(cmd)}", file=sys.stderr)
-        if is_nbg:
-            print(f"  LD_LIBRARY_PATH += {viplite_dir}", file=sys.stderr)
-        else:
-            print(f"  LD_LIBRARY_PATH += {timvx_lib_dir}:{viv_sdk_lib_dir}",
-                  file=sys.stderr)
-            print(f"  VIVANTE_SDK_DIR  = {viv_shim}", file=sys.stderr)
+        print(f"  LD_LIBRARY_PATH += {timvx_lib_dir}:{viv_sdk_lib_dir}",
+              file=sys.stderr)
+        print(f"  VIVANTE_SDK_DIR  = {viv_shim}", file=sys.stderr)
         print("---", file=sys.stderr)
 
         import time

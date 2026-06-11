@@ -1,11 +1,11 @@
-// custom_gemm.h — fp32 OpenCL GEMM custom op for the GC GPU.
+// custom_gemm.h — fp32 OpenCL GEMM custom op for the PPU.
 //
 // Lifted verbatim from TIM-VX/samples/custom_op_test/custom_gemm.{h,cc}
 // so this project owns its custom-op surface (TIM-VX docs/customized_op.md
 // explicitly supports hosting custom ops outside the TIM-VX tree).
 //
 // Used by timvx_runtime::matmul to bypass the NN-engine Matmul, which is
-// unreliable on VIP9000Nano-DI; this kernel runs on the GC shader core.
+// unreliable on VIP9000; this kernel runs on the shader core.
 
 #ifndef CUSTOM_OPS_CUSTOM_GEMM_H_
 #define CUSTOM_OPS_CUSTOM_GEMM_H_
